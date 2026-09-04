@@ -207,11 +207,9 @@ class FastLIOLocalization(Node):
 
         # 1. 粗調整 (scale=5)
         transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
-        transformation = self.flatten_transform(transformation)
 
         # 2. 精密調整 (scale=1) ★ 粗調整の結果 transformation を引き継ぐ
         transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1)
-        transformation = self.flatten_transform(transformation)
 
         if fitness > self.get_parameter("localization_threshold").value:
             self.T_map_to_odom = transformation
@@ -306,10 +304,9 @@ class FastLIOLocalization(Node):
             return
 
         initial_pose = np.matmul(initial_map_to_base, self.inverse_se3(self.pose_to_mat(self.cur_odom.pose.pose)))
-        initial_pose = self.flatten_transform(initial_pose)
         self.T_map_to_odom = initial_pose
         self.initialized = True
-        self.get_logger().info(f"Initial pose received (frame: {frame_id}). Flattened Roll/Pitch to horizontal.")
+        self.get_logger().info(f"Initial pose received (frame: {frame_id}).")
         self.publish_odom(initial_pose)
 
         if self.cur_scan is not None and self.cur_odom is not None:

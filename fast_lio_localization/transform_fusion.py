@@ -95,16 +95,15 @@ class TransformFusion(Node):
             T_odom_to_base_link = self.pose_to_mat(cur_odom.pose.pose)
             T_map_to_base_link = np.matmul(T_map_to_odom, T_odom_to_base_link)
 
-            # ロボット本体の姿勢は床面に対して完全水平 (Roll=0, Pitch=0, Yawのみ)
-            r, p, yaw = te.mat2euler(T_map_to_base_link[:3, :3], axes='sxyz')
-            R_horizontal = te.euler2mat(0.0, 0.0, yaw, axes='sxyz')
-            quat_wxyz = tq.mat2quat(R_horizontal)
+            quat_wxyz = tq.mat2quat(T_map_to_base_link[:3, :3])
             quat_xyzw = self.quat_wxyz_to_xyzw(quat_wxyz)
+
+            xyz = T_map_to_base_link[:3, 3]
 
             localization = Odometry()
             localization.pose.pose = Pose(
-                position = Point(x = xyz[0], y = xyz[1], z = xyz[2]), 
-                orientation = Quaternion(x = quat_xyzw[0], y = quat_xyzw[1], z = quat_xyzw[2], w = quat_xyzw[3])
+                position = Point(x = float(xyz[0]), y = float(xyz[1]), z = float(xyz[2])), 
+                orientation = Quaternion(x = float(quat_xyzw[0]), y = float(quat_xyzw[1]), z = float(quat_xyzw[2]), w = float(quat_xyzw[3]))
             )
             localization.twist = cur_odom.twist
 
