@@ -31,6 +31,8 @@ class FastLIOLocalization(Node):
         self.cur_scan = None
         self.scan_buffer = deque(maxlen=10)
         self.initialized = False
+        self.pending_initial_pose = None
+        self.last_localization_time = 0.0
 
         self.declare_parameters(
             namespace="",
@@ -205,17 +207,46 @@ class FastLIOLocalization(Node):
             self.get_logger().warn("Submap in FOV has too few points. Skip localization.")
             return
 
-        # 1. 粗調整 (scale=5)
-        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
+        # 1. 粗調整 (初回の初期位置設定時のみ広範囲 scale=3、走行中は局所 scale=1)
+        coarse_scale = 3 if not hasattr(self, '_has_converged') else 1
+        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=coarse_scale)
+        transformation = self.flatten_transform(transformation)
 
         # 2. 精密調整 (scale=1) ★ 粗調整の結果 transformation を引き継ぐ
         transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1)
+        transformation = self.flatten_transform(transformation)
 
-        if fitness > self.get_parameter("localization_threshold").value:
-            self.T_map_to_odom = transformation
-            self.publish_odom(transformation)
+        threshold = self.get_parameter("localization_threshold").value
+        if fitness >= threshold:
+            delta_trans = np.linalg.norm(transformation[:3, 3] - pose_estimation[:3, 3])
+            # 走行中に0.6m以上の急激なワープをブロック
+            if hasattr(self, '_has_converged') and delta_trans > 0.6:
+                self.get_logger().warn(f"ワープ防止: 変化量が大きすぎるため補正を棄却しました ({delta_trans:.2f} m > 0.6 m)")
+                return
+
+            _, _, cur_yaw = te.mat2euler(pose_estimation[:3, :3], axes="sxyz")
+            _, _, new_yaw = te.mat2euler(transformation[:3, :3], axes="sxyz")
+            diff_yaw = (new_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
+            if hasattr(self, '_has_converged') and abs(diff_yaw) > 0.35: # > 20度
+                self.get_logger().warn(f"ワープ防止: 角度変化が大きすぎるため補正を棄却しました ({np.degrees(abs(diff_yaw)):.1f}度 > 20度)")
+                return
+
+            # スムージング (急激なカクつきを抑えて滑らかに追従)
+            if hasattr(self, '_has_converged'):
+                alpha = 0.5
+                smooth_trans = np.copy(transformation)
+                smooth_trans[:3, 3] = (1 - alpha) * pose_estimation[:3, 3] + alpha * transformation[:3, 3]
+                smooth_yaw = cur_yaw + alpha * diff_yaw
+                smooth_trans[:3, :3] = te.euler2mat(0.0, 0.0, smooth_yaw, axes="sxyz")
+                self.T_map_to_odom = smooth_trans
+                self.publish_odom(smooth_trans)
+            else:
+                self._has_converged = True
+                self.T_map_to_odom = transformation
+                self.publish_odom(transformation)
+                self.get_logger().info(f"Initial alignment converged! Fitness: {fitness:.4f}")
         else:
-            self.get_logger().warn(f"Fitness score {fitness:.4f} less than threshold {self.get_parameter('localization_threshold').value:.4f}")
+            self.get_logger().warn(f"Fitness score {fitness:.4f} less than threshold {threshold:.4f}")
 
     def voxel_down_sample(self, pcd, voxel_size):
         # print(pcd)
@@ -230,31 +261,45 @@ class FastLIOLocalization(Node):
         return pcd_down
 
     def cb_save_cur_odom(self, msg):
+        first_odom = (self.cur_odom is None)
         self.cur_odom = msg
+        if first_odom:
+            self.get_logger().info(f"First Odometry received from FAST-LIO! Position: ({msg.pose.pose.position.x:.2f}, {msg.pose.pose.position.y:.2f}, {msg.pose.pose.position.z:.2f})")
+            if self.pending_initial_pose is not None:
+                pose_msg, frame_id = self.pending_initial_pose
+                self._handle_initial_pose(pose_msg, frame_id)
         
     def cb_save_cur_scan(self, msg):
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "odom",
-                msg.header.frame_id,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.2),
-            )
-        except TransformException as error:
-            self.get_logger().warn(f"Cannot transform LiDAR scan to odom: {error}", throttle_duration_sec=5.0)
-            return
-
-        rotation = tq.quat2mat([
-            transform.transform.rotation.w,
-            transform.transform.rotation.x,
-            transform.transform.rotation.y,
-            transform.transform.rotation.z,
-        ])
-        translation = np.array([
-            transform.transform.translation.x,
-            transform.transform.translation.y,
-            transform.transform.translation.z,
-        ])
+        if not hasattr(self, '_scan_count'):
+            self._scan_count = 0
+        self._scan_count += 1
+        if self._scan_count % 30 == 1:
+            self.get_logger().info(f"LiDAR scan # {self._scan_count} received ({msg.width * msg.height} points). FAST-LIO is active!")
+        if msg.header.frame_id == "odom":
+            rotation = np.eye(3)
+            translation = np.zeros(3)
+        else:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    "odom",
+                    msg.header.frame_id,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.2),
+                )
+                rotation = tq.quat2mat([
+                    transform.transform.rotation.w,
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                ])
+                translation = np.array([
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z,
+                ])
+            except TransformException as error:
+                self.get_logger().warn(f"Cannot transform LiDAR scan to odom: {error}", throttle_duration_sec=5.0)
+                return
         pc = self.msg_to_array(msg)
         pc = (rotation @ pc.T).T + translation
         # 斜め天井などの高所点群を除外（ロボットのZ位置からの相対高さで判定）
@@ -278,6 +323,13 @@ class FastLIOLocalization(Node):
         header = copy.copy(msg.header)
         header.frame_id = "odom"
         self.publish_point_cloud(self.pub_pc_in_map, header, accumulated_pc)
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        interval = 1.0 / self.get_parameter("freq_localization").value
+        if self.initialized and (now_sec - self.last_localization_time >= interval or now_sec < self.last_localization_time):
+            self.last_localization_time = now_sec
+            if self.cur_scan is not None and self.cur_odom is not None:
+                self.global_localization(self.T_map_to_odom)
         
     def initialize_global_map(self): #, pc_msg):
         # self.global_map = o3d.geometry.PointCloud()
@@ -298,15 +350,20 @@ class FastLIOLocalization(Node):
         self.get_logger().info("Global map received.")
 
     def _handle_initial_pose(self, pose_msg, frame_id):
+        if hasattr(self, '_has_converged'):
+            del self._has_converged
+        self.pending_initial_pose = (pose_msg, frame_id)
         initial_map_to_base = self.pose_to_mat(pose_msg)
         if self.cur_odom is None:
-            self.get_logger().warn("Initial pose received, but odometry is not available yet.")
-            return
+            self.get_logger().info("Initial pose received, applying initial estimate (waiting for odometry)...")
+            initial_pose = initial_map_to_base
+        else:
+            initial_pose = np.matmul(initial_map_to_base, self.inverse_se3(self.pose_to_mat(self.cur_odom.pose.pose)))
 
-        initial_pose = np.matmul(initial_map_to_base, self.inverse_se3(self.pose_to_mat(self.cur_odom.pose.pose)))
+        initial_pose = self.flatten_transform(initial_pose)
         self.T_map_to_odom = initial_pose
         self.initialized = True
-        self.get_logger().info(f"Initial pose received (frame: {frame_id}).")
+        self.get_logger().info(f"Initial pose set successfully (frame: {frame_id}).")
         self.publish_odom(initial_pose)
 
         if self.cur_scan is not None and self.cur_odom is not None:
@@ -324,8 +381,8 @@ class FastLIOLocalization(Node):
         quat_wxyz = tq.mat2quat(transform[:3, :3])
         quat_xyzw = self.quat_wxyz_to_xyzw(quat_wxyz)
         odom_msg.pose.pose = Pose(
-            position = Point(x = xyz[0], y = xyz[1], z = xyz[2]), 
-            orientation = Quaternion(x = quat_xyzw[0], y = quat_xyzw[1], z = quat_xyzw[2], w = quat_xyzw[3])
+            position = Point(x = float(xyz[0]), y = float(xyz[1]), z = float(xyz[2])), 
+            orientation = Quaternion(x = float(quat_xyzw[0]), y = float(quat_xyzw[1]), z = float(quat_xyzw[2]), w = float(quat_xyzw[3]))
         )
         odom_msg.header.stamp = self.get_clock().now().to_msg()
         odom_msg.header.frame_id = "map"

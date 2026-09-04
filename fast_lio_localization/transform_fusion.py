@@ -56,46 +56,42 @@ class TransformFusion(Node):
         return trans
 
     def transform_fusion(self):
-        if self.cur_odom_to_baselink is None:
-            return
-
         if self.cur_map_to_odom is not None:
             T_map_to_odom = self.pose_to_mat(self.cur_map_to_odom.pose.pose)
         else:
             T_map_to_odom = np.eye(4)
 
         transform_msg = Transform()
-        transform_msg.translation.x = T_map_to_odom[0, 3]
-        transform_msg.translation.y = T_map_to_odom[1, 3]
-        transform_msg.translation.z = T_map_to_odom[2, 3]
+        transform_msg.translation.x = float(T_map_to_odom[0, 3])
+        transform_msg.translation.y = float(T_map_to_odom[1, 3])
+        transform_msg.translation.z = float(T_map_to_odom[2, 3])
         
         quat_wxyz = tq.mat2quat(T_map_to_odom[:3, :3])
         quat_xyzw = self.quat_wxyz_to_xyzw(quat_wxyz)
 
-        transform_msg.rotation.x = quat_xyzw[0]
-        transform_msg.rotation.y = quat_xyzw[1]
-        transform_msg.rotation.z = quat_xyzw[2]
-        transform_msg.rotation.w = quat_xyzw[3]
+        transform_msg.rotation.x = float(quat_xyzw[0])
+        transform_msg.rotation.y = float(quat_xyzw[1])
+        transform_msg.rotation.z = float(quat_xyzw[2])
+        transform_msg.rotation.w = float(quat_xyzw[3])
         
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.cur_odom_to_baselink.header.frame_id
-        
-        # print(self.cur_odom_to_baselink.header)
-        transform_stamped_msg = tf2_ros.TransformStamped(
-                header = self.cur_odom_to_baselink.header,
-            child_frame_id = "odom",
-                transform = transform_msg
-            )
+        transform_stamped_msg = tf2_ros.TransformStamped()
+        transform_stamped_msg.header.stamp = self.get_clock().now().to_msg()
         transform_stamped_msg.header.frame_id = "map"
+        transform_stamped_msg.child_frame_id = "odom"
+        transform_stamped_msg.transform = transform_msg
         self.tf_broadcaster.sendTransform(transform_stamped_msg)
+
+        if self.cur_odom_to_baselink is None:
+            return
 
         cur_odom = copy.copy(self.cur_odom_to_baselink)
         if cur_odom is not None:
             T_odom_to_base_link = self.pose_to_mat(cur_odom.pose.pose)
             T_map_to_base_link = np.matmul(T_map_to_odom, T_odom_to_base_link)
 
-            quat_wxyz = tq.mat2quat(T_map_to_base_link[:3, :3])
+            r, p, yaw = te.mat2euler(T_map_to_base_link[:3, :3], axes="sxyz")
+            R_horizontal = te.euler2mat(0.0, 0.0, yaw, axes="sxyz")
+            quat_wxyz = tq.mat2quat(R_horizontal)
             quat_xyzw = self.quat_wxyz_to_xyzw(quat_wxyz)
 
             xyz = T_map_to_base_link[:3, 3]
@@ -112,6 +108,11 @@ class TransformFusion(Node):
             localization.child_frame_id = "body"
             self.pub_localization.publish(localization)
             self.publish_robot_marker(localization)
+            if not hasattr(self, '_pub_count'):
+                self._pub_count = 0
+            self._pub_count += 1
+            if self._pub_count % 50 == 1:
+                self.get_logger().info(f"Robot localized pose: x={xyz[0]:.2f}, y={xyz[1]:.2f}, z={xyz[2]:.2f}")
 
     def publish_robot_marker(self, localization):
         marker = Marker()
@@ -135,9 +136,11 @@ class TransformFusion(Node):
 
     def cb_save_cur_odom(self, msg):
         self.cur_odom_to_baselink = msg
+        self.transform_fusion()
 
     def cb_save_map_to_odom(self, msg):
         self.cur_map_to_odom = msg
+        self.transform_fusion()
 
 
 def main(args=None):

@@ -89,7 +89,7 @@ def generate_launch_description():
                      "scan_voxel_size": 0.1,
                      "freq_localization": 0.5,
                      "freq_global_map": 0.25,
-                     "localization_threshold": 0.3,
+                     "localization_threshold": 0.5,
                      "max_height": 2.2,
                      "fov": 6.28319,
                      "fov_far": 300,
@@ -125,7 +125,7 @@ def generate_launch_description():
         output="screen",
         parameters=[{"file_name": pcd_map_path,
                      "tf_frame": "map",
-                    "cloud_topic": pcd_map_topic,
+                    "cloud_topic": pcd_map_topic, "use_sim_time": use_sim_time,
                     "period_ms_": 500}],
         remappings=[
             ("cloud_pcd", pcd_map_topic),
@@ -133,7 +133,7 @@ def generate_launch_description():
         condition=IfCondition(map_is_set),
     )
 
-    rviz_node = Node(package="rviz2", executable="rviz2", arguments=["-d", rviz_cfg], condition=IfCondition(rviz_use))
+    rviz_node = Node(package="rviz2", executable="rviz2", arguments=["-d", rviz_cfg], condition=IfCondition(rviz_use), parameters=[{"use_sim_time": use_sim_time}])
 
     ld = LaunchDescription()
     ld.add_action(declare_use_sim_time_cmd)
