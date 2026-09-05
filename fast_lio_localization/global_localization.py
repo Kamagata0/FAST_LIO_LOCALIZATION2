@@ -207,44 +207,60 @@ class FastLIOLocalization(Node):
             self.get_logger().warn("Submap in FOV has too few points. Skip localization.")
             return
 
-        # 1. 粗調整 (初回の初期位置設定時のみ広範囲 scale=3、走行中は局所 scale=1)
-        coarse_scale = 3 if not hasattr(self, '_has_converged') else 1
-        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=coarse_scale)
-        transformation = self.flatten_transform(transformation)
-
-        # 2. 精密調整 (scale=1) ★ 粗調整の結果 transformation を引き継ぐ
-        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1)
+        # 初回・走行中ともに scale=1 で精密マッチング（広範囲探索による遠くの壁への誤吸着・ジャンプを防止）
+        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
         transformation = self.flatten_transform(transformation)
 
         threshold = self.get_parameter("localization_threshold").value
-        if fitness >= threshold:
-            delta_trans = np.linalg.norm(transformation[:3, 3] - pose_estimation[:3, 3])
-            # 走行中に0.6m以上の急激なワープをブロック
-            if hasattr(self, '_has_converged') and delta_trans > 0.6:
-                self.get_logger().warn(f"ワープ防止: 変化量が大きすぎるため補正を棄却しました ({delta_trans:.2f} m > 0.6 m)")
+        delta_trans = np.linalg.norm(transformation[:3, 3] - pose_estimation[:3, 3])
+        _, _, cur_yaw = te.mat2euler(pose_estimation[:3, :3], axes="sxyz")
+        _, _, new_yaw = te.mat2euler(transformation[:3, :3], axes="sxyz")
+        diff_yaw = (new_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
+
+        # 初回の初期位置合わせ判定
+        if not hasattr(self, '_has_converged'):
+            # ユーザーが指定した位置から 0.4m 以上または 15度 以上離れる誤吸着はブロック
+            if delta_trans > 0.4 or abs(diff_yaw) > 0.26:
+                self.get_logger().warn(
+                    f"初期位置からの移動量が大きすぎるため補正をスキップし、指定位置を採用しました "
+                    f"(移動: {delta_trans:.2f}m > 0.4m, 角度: {np.degrees(abs(diff_yaw)):.1f}度 > 15度)"
+                )
+                self._has_converged = True
+                self.T_map_to_odom = pose_estimation
+                self.publish_odom(pose_estimation)
                 return
 
-            _, _, cur_yaw = te.mat2euler(pose_estimation[:3, :3], axes="sxyz")
-            _, _, new_yaw = te.mat2euler(transformation[:3, :3], axes="sxyz")
-            diff_yaw = (new_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
-            if hasattr(self, '_has_converged') and abs(diff_yaw) > 0.35: # > 20度
+            if fitness >= threshold:
+                self._has_converged = True
+                self.T_map_to_odom = transformation
+                self.publish_odom(transformation)
+                self.get_logger().info(f"初期位置の精密合わせに成功しました！ Fitness: {fitness:.4f} (移動: {delta_trans:.2f}m)")
+            else:
+                self.get_logger().warn(f"Fitness ({fitness:.4f}) が閾値 ({threshold:.4f}) 未満のため、指定位置をベースにします。")
+                self._has_converged = True
+                self.T_map_to_odom = pose_estimation
+                self.publish_odom(pose_estimation)
+            return
+
+        # 走行中の補正判定
+        if fitness >= threshold:
+            # 走行中に0.5m以上の急激なワープをブロック
+            if delta_trans > 0.5:
+                self.get_logger().warn(f"ワープ防止: 変化量が大きすぎるため補正を棄却しました ({delta_trans:.2f} m > 0.5 m)")
+                return
+
+            if abs(diff_yaw) > 0.35: # > 20度
                 self.get_logger().warn(f"ワープ防止: 角度変化が大きすぎるため補正を棄却しました ({np.degrees(abs(diff_yaw)):.1f}度 > 20度)")
                 return
 
             # スムージング (急激なカクつきを抑えて滑らかに追従)
-            if hasattr(self, '_has_converged'):
-                alpha = 0.5
-                smooth_trans = np.copy(transformation)
-                smooth_trans[:3, 3] = (1 - alpha) * pose_estimation[:3, 3] + alpha * transformation[:3, 3]
-                smooth_yaw = cur_yaw + alpha * diff_yaw
-                smooth_trans[:3, :3] = te.euler2mat(0.0, 0.0, smooth_yaw, axes="sxyz")
-                self.T_map_to_odom = smooth_trans
-                self.publish_odom(smooth_trans)
-            else:
-                self._has_converged = True
-                self.T_map_to_odom = transformation
-                self.publish_odom(transformation)
-                self.get_logger().info(f"Initial alignment converged! Fitness: {fitness:.4f}")
+            alpha = 0.5
+            smooth_trans = np.copy(transformation)
+            smooth_trans[:3, 3] = (1 - alpha) * pose_estimation[:3, 3] + alpha * transformation[:3, 3]
+            smooth_yaw = cur_yaw + alpha * diff_yaw
+            smooth_trans[:3, :3] = te.euler2mat(0.0, 0.0, smooth_yaw, axes="sxyz")
+            self.T_map_to_odom = smooth_trans
+            self.publish_odom(smooth_trans)
         else:
             self.get_logger().warn(f"Fitness score {fitness:.4f} less than threshold {threshold:.4f}")
 
@@ -352,6 +368,7 @@ class FastLIOLocalization(Node):
     def _handle_initial_pose(self, pose_msg, frame_id):
         if hasattr(self, '_has_converged'):
             del self._has_converged
+        self.scan_buffer.clear()
         self.pending_initial_pose = (pose_msg, frame_id)
         initial_map_to_base = self.pose_to_mat(pose_msg)
         if self.cur_odom is None:

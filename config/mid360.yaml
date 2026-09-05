@@ -31,7 +31,7 @@
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  true     # Isaac Sim already provides a stable calibration; no online estimation needed here
-            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_T: [ 0.0, 0.0, 0.0 ]
             extrinsic_R: [ 1., 0., 0.,
                             0., 1., 0.,
                             0., 0., 1.]

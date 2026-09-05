@@ -113,7 +113,7 @@ def generate_launch_description():
         package="tf2_ros",
         executable="static_transform_publisher",
         name="base_link_to_livox_frame",
-        arguments=["-0.011", "-0.02329", "0.04412", "0", "0", "0", "body", "livox_frame"],
+        arguments=["0", "0", "0", "0", "0", "0", "body", "livox_frame"],
         output="screen",
     )
     
@@ -126,7 +126,7 @@ def generate_launch_description():
         parameters=[{"file_name": pcd_map_path,
                      "tf_frame": "map",
                     "cloud_topic": pcd_map_topic, "use_sim_time": use_sim_time,
-                    "period_ms_": 500}],
+                    "period_ms_": 10000}],
         remappings=[
             ("cloud_pcd", pcd_map_topic),
         ],
