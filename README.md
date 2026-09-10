@@ -1,281 +1,308 @@
 # FAST-LIO-LOCALIZATION2
 
-事前に作成した点群地図と、LiDAR が取得した現在の点群を照合して、ロボットの自己位置を推定する ROS 2 パッケージです。
+事前に作成した点群地図（PCD）と、LiDAR が取得した現在の点群を照合して、ロボットの自己位置（グローバル位置姿勢）をリアルタイムに推定する ROS 2 パッケージです。
 
-Isaac Sim と実機Livoxの両方に対応しており、起動時の `lidar_mode` で入力形式を切り替えます。どちらのモードでもFAST-LIOとIMUを使用し、地図照合で自己位置を補正します。
+**Isaac Sim（シミュレーション）** と **実機Livox（Mid-360 等）** の両方に対応しており、起動時の `lidar_mode` 引数で切り替えます。
 
-## 構成
+---
+
+## 構成概要
 
 ```text
-LiDAR + IMU → FAST-LIO → /cloud_registered + /Odometry
-                                  ↓
-事前点群地図 robocon2026_field.pcd → ICPによる地図照合
-                                  ↓
-                    /map_to_odom → /localization
+[LiDAR] + [IMU]
+      ↓
+[FAST-LIO (fastlio_mapping)] → /cloud_registered (現在点群) + /Odometry
+      ↓
+事前点群地図 (.pcd) → [ICP 地図照合 (global_localization.py)]
+      ↓
+/map_to_odom → [TF統合 (transform_fusion.py)] → /localization
 ```
 
-## Isaac Simと実機の違い
+### TF ツリー
+```text
+map → odom → body → livox_frame
+```
+- `map → odom`: `global_localization.py` / `transform_fusion.py` が発行（地図照合による補正）
+- `odom → body`: FAST-LIO (`fastlio_mapping`) が発行（オドメトリ）
+- `body → livox_frame`: launch 内の `static_transform_publisher` が発行
+
+---
+
+## Isaac Sim と 実機Livox の違い
 
 | 項目 | Isaac Sim | 実機Livox |
 |---|---|---|
 | 起動モード | `lidar_mode:=isaac` | `lidar_mode:=livox` |
-| LiDAR型 | `sensor_msgs/msg/PointCloud2` | `livox_ros_driver2/msg/CustomMsg` |
-| LiDARトピック | `/livox/lidar`（変更時は`lidar_topic`で指定） | `/livox/lidar` |
-| IMU型 | `sensor_msgs/msg/Imu` | `sensor_msgs/msg/Imu` |
-| IMUトピック | `imu_topic`で指定 | 通常 `/livox/imu` |
-| FAST-LIO | PointCloud2入力で起動 | CustomMsg入力で起動 |
+| LiDAR メッセージ型 | `sensor_msgs/msg/PointCloud2` | `livox_ros_driver2/msg/CustomMsg` |
+| LiDAR トピック名 | `/livox/lidar`（変更時は `lidar_topic` で指定） | `/livox/lidar` |
+| IMU メッセージ型 | `sensor_msgs/msg/Imu` | `sensor_msgs/msg/Imu` |
+| IMU トピック名 | `imu_topic` で指定（デフォルト `/livox/imu`） | 通常 `/livox/imu` |
+| ドライバ起動 | 不要（Isaac Sim から直接配信） | 必要（`livox_ros_driver2` を起動） |
 
-Isaac SimではLiDARとIMUをROS 2へPublishしてください。実機では先に `livox_ros_driver2` を起動します。FAST-LIOの出力は、両モードとも `/cloud_registered` と `/Odometry` に統一されます。
-
-TF は次の構成にします。
-
-```text
-map → odom → body → livox_frame
-```
+---
 
 ## 必要な環境
 
-- Ubuntu 20.04 以降
-- ROS 2 Humble
-- Python 3.8以降
-- Open3D
-- ros2_numpy
-- transforms3d
-- tf_transformations
-- pcl_ros
-- livox_ros_driver2
+- **OS**: Ubuntu 20.04 / 22.04
+- **ROS 2**: Humble（推奨）
+- **C++**: C++17, OpenMP, PCL, Eigen3
+- **Python**: Python 3.8+ (Open3D, NumPy < 2.0, transforms3d, ros2_numpy)
 
-依存パッケージをインストールします。
+---
+
+## 環境構築手順（どのPCでも再現可能）
+
+### 1. ROS 2 依存パッケージのインストール
 
 ```bash
-sudo apt install ros-humble-pcl-ros
-sudo apt install ros-humble-tf-transformations
-python3 -m pip install --user open3d ros2-numpy transforms3d
+sudo apt update
+sudo apt install -y \
+  ros-humble-pcl-ros \
+  ros-humble-pcl-conversions \
+  ros-humble-tf-transformations \
+  ros-humble-visualization-msgs \
+  ros-humble-perception-pcl \
+  python3-pip
 ```
 
-`transforms3d`で`np.float`エラーが出る場合は、`/usr/lib/python3/dist-packages/transforms3d/quaternions.py`の`np.float`を`float`に置き換えてください。
+### 2. Python 依存ライブラリのインストール
+
+```bash
+# NumPy 2.x との非互換を防ぐため numpy<2.0.0 を指定します
+python3 -m pip install --user "numpy<2.0.0" open3d transforms3d ros2-numpy
+```
+> **注意**: Ubuntu 22.04 等で `externally-managed-environment` エラーが出る場合は、`--break-system-packages` オプションを付けて実行してください。
+
+#### transforms3d の `np.float` 非推奨エラー対応
+`transforms3d` 内部で古い `np.float` が使われている場合があるため、以下のコマンドを実行して自動修正します。
+
+```bash
+python3 -c "
+import transforms3d.quaternions as tq
+path = tq.__file__
+with open(path, 'r') as f:
+    code = f.read()
+if 'np.float' in code:
+    with open(path, 'w') as f:
+        f.write(code.replace('np.float', 'float'))
+    print('Successfully patched transforms3d (np.float -> float)')
+else:
+    print('transforms3d is already compatible')
+"
+```
+
+---
+
+### 3. Livox-SDK2 のビルド・インストール（必須）
+
+本パッケージの C++ ノードは `livox_ros_driver2` に依存しているため、事前に **Livox-SDK2** をインストールします（Isaac Sim のみを使用する場合でもビルドに必要です）。
+
+```bash
+cd ~
+git clone https://github.com/Livox-SDK/Livox-SDK2.git
+cd Livox-SDK2
+mkdir build && cd build
+cmake .. && make -j$(nproc)
+sudo make install
+```
+
+---
+
+### 4. ROS 2 ワークスペースの作成とリポジトリの配置
+
+ワークスペース（例: `~/ros2_ws`）を作成し、ソースディレクトリにリポジトリを配置します。
+
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+
+# 1. 本リポジトリ（既にクローン済みの場合は配置）
+# git clone <本リポジトリURL> FAST_LIO_LOCALIZATION2
+
+# 2. livox_ros_driver2 のクローン（ビルドに必須）
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+```
+
+---
 
 ## ビルド
 
-ROS 2 ワークスペースのルートで実行します。
+ROS 2 ワークスペースのルートディレクトリに移動してビルドします。
 
 ```bash
-cd /ros2_ws
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+
+# 1. livox_ros_driver2 のビルド
+colcon build --symlink-install --packages-select livox_ros_driver2 --cmake-args -DROS_EDITION=ROS2
+
+# 2. fast_lio_localization のビルド
 colcon build --symlink-install --packages-select fast_lio_localization
-source /opt/ros/humble/setup.bash
-source /home/akeru/ros2_ws/install/setup.bash
+
+# 3. ワークスペースの環境変数を読み込み
+source install/setup.bash
 ```
 
-## Isaac Sim 側の設定
+> **TIP**: 毎回 `source` する手間を省く場合は、`~/.bashrc` に追記しておくと便利です：
+> ```bash
+> echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
+> ```
 
-### LiDARとIMU
+---
 
-ROS 2 Publish Point Cloud の設定:
+## 起動方法
 
-```text
-Topic: /livox/lidar
-Type: sensor_msgs/msg/PointCloud2
-Frame: livox_frame
-```
+### A. Isaac Sim（シミュレータ）で使用する場合
 
-IMUの例:
+#### 1. Isaac Sim 側の設定
+Action Graph などで以下のトピックをパブリッシュするように設定します：
+- **LiDAR 点群**:
+  - トピック名: `/livox/lidar`
+  - メッセージ型: `sensor_msgs/msg/PointCloud2`
+  - フレームID: `livox_frame`
+- **IMU**:
+  - トピック名: `/livox/imu`
+  - メッセージ型: `sensor_msgs/msg/Imu`
+  - フレームID: `imu_link`
 
-```text
-Topic: /livox/imu
-Type: sensor_msgs/msg/Imu
-Frame: imu_link
-```
+> **重要**: FAST-LIO は LiDAR 点群と IMU の**両方**を受信しないと処理（点群登録・自己位置推定）を開始しません。
 
-Isaac Simのオドメトリ入力は不要です。FAST-LIOがIMUとPointCloud2から `/Odometry` を生成します。
+#### 2. Isaac Sim でシミュレーションを Play（再生）
 
-## 実機Livox側の設定
-
-先にLivoxドライバを起動し、通常は次のトピックをPublishします。
-
-```text
-/livox/lidar : livox_ros_driver2/msg/CustomMsg
-/livox/imu   : sensor_msgs/msg/Imu
-```
-
-`xfer_format:=1` はCustomMsg出力です。
-
-### TF
-
-必要なTF:
-
-```text
-odom → body           動的
-body → livox_frame    静的
-```
-
-FAST-LIOが`odom → body`を出力し、launchが`body → livox_frame`を発行します。
-
-## 起動
-
-デフォルトでは次の地図を使用します。
-
-```text
-robocon2026_field.pcd
-```
-
-Isaac SimとROS 2のLiDAR・IMU Publishを開始した後、別ターミナルで起動します。
+#### 3. ローカライゼーションノードの起動
+別ターミナルを開いて起動します（デフォルトで RViz2 も起動します）：
 
 ```bash
-cd /ros2_ws
+cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-source /ros2_ws/install/setup.bash
-ros2 launch fast_lio_localization localization.launch.py
+source install/setup.bash
+
+ros2 launch fast_lio_localization localization.launch.py lidar_mode:=isaac
 ```
 
-このlaunchはデフォルトでRViz2も起動します。RViz2を起動しない場合は、次のように指定します。
-
-```bash
-ros2 launch fast_lio_localization localization.launch.py rviz:=false
-```
-
-Isaac Simのデフォルトトピックは実機と同じ `/livox/lidar` と `/livox/imu` です。トピック名を変更している場合だけ、起動時に上書きします。
-
+※トピック名を独自に変更している場合は引数で指定できます：
 ```bash
 ros2 launch fast_lio_localization localization.launch.py \
   lidar_mode:=isaac \
-  lidar_topic:=/livox/lidar \
-  imu_topic:=/livox/imu
+  lidar_topic:=/my_robot/lidar \
+  imu_topic:=/my_robot/imu
 ```
 
-例えばIsaac Sim側を `/isaac/lidar` と `/isaac/imu` に変更した場合:
+---
 
+### B. 実機 Livox（Mid-360）で使用する場合
+
+#### 1. Livox ドライバの起動
 ```bash
-ros2 launch fast_lio_localization localization.launch.py \
-  lidar_mode:=isaac \
-  lidar_topic:=/isaac/lidar \
-  imu_topic:=/isaac/imu
-```
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
 
-実機Livoxの場合:
-
-```bash
+# CustomMsg 形式 (xfer_format:=1) で起動
 ros2 launch fast_lio_localization livox.launch.py xfer_format:=1
-ros2 launch fast_lio_localization localization.launch.py \
-  lidar_mode:=livox \
-  lidar_topic:=/livox/lidar \
-  imu_topic:=/livox/imu
 ```
 
-別の地図を使う場合:
+#### 2. ローカライゼーションノードの起動
+別ターミナルで起動します：
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch fast_lio_localization localization.launch.py lidar_mode:=livox
+```
+
+---
+
+### 別の地図（.pcd）を使用する場合
+
+デフォルトでは `maps/robocon2026_field.pcd` が読み込まれます。別の地図ファイルを使用したい場合は `map` 引数で絶対パスを指定します：
 
 ```bash
 ros2 launch fast_lio_localization localization.launch.py \
-  map:=/absolute/path/to/map.pcd
+  lidar_mode:=isaac \
+  map:=/path/to/your_map.pcd
 ```
 
-## RViz で初期位置を指定
+---
 
-RViz2では、起動後に次を確認します。
+## RViz2 での初期位置合わせ手順
 
-1. RViz の Fixed Frame が `map` であることを確認します。
-2. `2D Pose Estimate` を選びます。
-3. 地図上のロボットのおおよその位置をクリックします。
-4. ロボットの向きに合わせてドラッグします。
-5. ロボットを停止した状態で ICP が実行されるのを待ちます。
+起動直後はロボットの初期位置がずれているため、RViz2 上で大まかな初期位置を与えて地図照合（ICP）を収束させます。
 
-初期位置は完全な自己位置ではなく、ICP が探索を始めるための大まかな位置です。地図と現在の点群の座標系も一致している必要があります。
+1. RViz2 の画面上部にある **`2D Pose Estimate`** ツールをクリックします。
+2. 地図点群上の**ロボットがいるおおよその位置をクリック**し、**ロボットの進行方向（向き）へドラッグ**して離します。
+3. ロボットを静止させたまま数秒待つと、グローバル地図（白/グレー）とリアルタイム点群（`/cloud_registered`）が壁や障害物の位置にピタッと重なります。
 
-## 動作確認
+---
 
-Isaac Sim の入力:
+## 動作確認用コマンド
+
+トピックが正常に配信されているか確認するコマンドです：
 
 ```bash
-ros2 topic type /livox/lidar
-ros2 topic type /livox/imu
+# 入力トピックの確認
 ros2 topic hz /livox/lidar
 ros2 topic hz /livox/imu
-```
 
-期待される型:
+# 出力トピックの確認
+ros2 topic hz /cloud_registered   # FAST-LIO処理後の点群
+ros2 topic hz /map                # 事前地図の点群
+ros2 topic echo /map_to_odom --once  # 地図照合オフセット
+ros2 topic echo /localization --once # 推定自己位置
 
-```text
-sensor_msgs/msg/PointCloud2
-sensor_msgs/msg/Imu
-```
-
-TF の確認:
-
-```bash
+# TF ツリーの確認
+ros2 run tf2_ros tf2_echo map odom
 ros2 run tf2_ros tf2_echo odom body
 ros2 run tf2_ros tf2_echo body livox_frame
 ```
 
-自己位置推定結果の確認:
-
-```bash
-ros2 topic echo /map_to_odom --once
-ros2 topic echo /localization --once
-```
-
-成功すると、白い事前地図と LiDAR 点群が同じ壁・柱・障害物の位置に重なります。
+---
 
 ## トラブルシューティング
 
-### `/map_to_odom` が出ない
+### 1. 点群が RViz2 に表示されない / 出ない
+- **IMU トピックは届いていますか？**: `ros2 topic hz /livox/imu` を確認してください。FAST-LIO は IMU が無いと点群を一切処理・出力しません。
+- **Isaac Sim の Action Graph でエラーが出ていませんか？**: センサー Prim の参照パスが切れていると、点群ノードが停止します。
+- **RViz2 の Fixed Frame**: 左上 `Global Options` -> `Fixed Frame` が `map`（または `odom`）になっているか確認してください。
 
-次を確認します。
+### 2. ビルド時に `livox_ros_driver2Config.cmake` が見つからない
+- `Livox-SDK2` が正しくインストールされているか確認してください。
+- `~/ros2_ws/src` に `livox_ros_driver2` をクローンし、先にビルドしてから `fast_lio_localization` をビルドしてください。
 
-```bash
-ros2 topic info /livox/lidar
-ros2 topic info /Odometry
-ros2 node list
-```
-
-`/livox/lidar` と `/livox/imu` にpublisherが必要です。初期姿勢を送った後、`/cloud_registered` と `/Odometry` が出力され、launchログに `Fitness score` が表示されます。
-
-### LiDAR 点群が回転して見える
-
-LiDAR点群が回転して見える場合は、IMUの軸、LiDARとIMUの取り付け方向、初期化時に機体が動いていなかったかを確認します。
-
-```text
-正しい: odom → body → livox_frame
-誤り:   odom → livox_frame
-```
-
-ロボット停止中に`odom → body`の姿勢が変化する場合は、IMUの軸・取り付け方向・初期化状態を確認します。
-
-### `extrapolation` が出る
-
-LiDAR、オドメトリ、TF の時刻を Isaac Sim のシミュレーション時刻に統一します。起動直後の軽微な警告は、TF が蓄積するまで発生することがあります。
-
-### 古い設定が起動する
-
-次の環境を使っていることを確認します。
+### 3. ビルドキャッシュや古いユーザー名のパスが残っている
+過去に別の環境やユーザー名でビルドしたキャッシュが残っている場合は、`build/` と `install/` を削除してクリーンビルドしてください：
 
 ```bash
-unset AMENT_PREFIX_PATH
-unset COLCON_PREFIX_PATH
-source /opt/ros/humble/setup.bash
-source ros2_ws/install/setup.bash
+cd ~/ros2_ws
+rm -rf build/ install/ log/
+colcon build --symlink-install
 ```
 
-RViz2は[rviz/fastlio_localization.rviz](rviz/fastlio_localization.rviz)を使用します。
+### 4. 点群が回転・傾いてずれる
+- IMU と LiDAR の取り付け向き（回転行列）が合っているか確認してください。
+- 起動直後のキャリブレーション中はロボットを静止させてください。
+
+---
 
 ## トピック一覧
 
-| トピック | 型 | 役割 |
+| トピック名 | 型 | 説明 |
 |---|---|---|
-| `/livox/lidar` | `sensor_msgs/msg/PointCloud2` または `livox_ros_driver2/msg/CustomMsg` | Isaac Simまたは実機Livoxの入力 |
-| `/livox/imu` | `sensor_msgs/msg/Imu` | Isaac Simまたは実機LivoxのIMU入力 |
-| `/cloud_registered` | `sensor_msgs/msg/PointCloud2` | FAST-LIO後の現在点群 |
-| `/Odometry` | `nav_msgs/msg/Odometry` | FAST-LIOのオドメトリ |
-| `/map` | `sensor_msgs/msg/PointCloud2` | 事前地図 |
-| `/cur_scan_in_map` | `sensor_msgs/msg/PointCloud2` | 現在スキャンの表示用点群 |
-| `/submap` | `sensor_msgs/msg/PointCloud2` | ICP 用に切り出した地図 |
-| `/map_to_odom` | `nav_msgs/msg/Odometry` | 地図から odom への補正 |
-| `/localization` | `nav_msgs/msg/Odometry` | 補正後のロボット位置 |
+| `/livox/lidar` | `PointCloud2` または `CustomMsg` | LiDAR 入力データ |
+| `/livox/imu` | `sensor_msgs/msg/Imu` | 6軸 IMU 入力データ |
+| `/cloud_registered` | `sensor_msgs/msg/PointCloud2` | FAST-LIO が統合した現在のリアルタイム点群 |
+| `/Odometry` | `nav_msgs/msg/Odometry` | FAST-LIO による高周波オドメトリ |
+| `/map` | `sensor_msgs/msg/PointCloud2` | 事前地図（PCD）の点群 |
+| `/cur_scan_in_map` | `sensor_msgs/msg/PointCloud2` | 地図座標系に変換されたスキャン点群 |
+| `/map_to_odom` | `nav_msgs/msg/Odometry` | グローバル地図とオドメトリ間の補正量 |
+| `/localization` | `nav_msgs/msg/Odometry` | 補正後の最終的な自己位置姿勢 |
 
-## 関連プロジェクト
+---
+
+## 関連プロジェクト & 謝辞
 
 - [FAST-LIO](https://github.com/hku-mars/FAST_LIO)
 - [FAST-LIO-ROS2](https://github.com/Ericsii/FAST_LIO_ROS2)
 - [ikd-Tree](https://github.com/hku-mars/ikd-Tree)
-
-## 謝辞
-
-本パッケージは FAST-LIO および Fast-Lio-Localization の成果をもとにしています。
+- [Fast-Lio-Localization](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION)
