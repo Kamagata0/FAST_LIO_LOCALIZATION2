@@ -194,10 +194,8 @@ float64 opponent_angle_deg   # 敵ロボットの方位角 [deg]
 ### 2. 主要トピック一覧
 | トピック名 | メッセージ型 | 配信周期 | 説明 |
 |---|---|---|---|
-| `/robot_pose` | `geometry_msgs/msg/PoseStamped` | 50Hz | ロボットの絶対位置姿勢 $(X, Y, \text{Yaw})$ |
 | `/robot_pose` | `geometry_msgs/msg/PoseStamped` | 50Hz | 自機ロボットの絶対位置姿勢 $(X, Y, \text{Yaw})$ |
 | `/target_relative` | `geometry_msgs/msg/PointStamped` | 50Hz | ターゲットの車体基準相対座標 |
-| `/robot_status` | `fast_lio_localization/msg/RobotStatus` | 50Hz | ベルト速度・シリンダ・ターゲット総合情報 |
 | `/opponent_pose` | `geometry_msgs/msg/PoseStamped` | 50Hz | 相手ロボット（敵機）の絶対位置座標 $(X, Y)$ |
 | `/opponent_relative` | `geometry_msgs/msg/PointStamped` | 50Hz | 相手ロボットの相対距離・方位 |
 | `/robot_status` | `fast_lio_localization/msg/RobotStatus` | 50Hz | ベルト速度・シリンダ・ターゲット・敵機総合情報 |
@@ -212,22 +210,18 @@ float64 opponent_angle_deg   # 敵ロボットの方位角 [deg]
 ## 🛠 動作確認用コマンド
 
 ```bash
-# 1. 自己位置の確認 (X, Y, Yaw)
 # 1. 自機自己位置の確認 (X, Y, Yaw)
 ros2 topic echo /robot_pose --once
 
-# 2. ターゲット相対距離・方位の確認
 # 2. 相手ロボット（敵機）の位置確認
 ros2 topic echo /opponent_pose --once
 
 # 3. ターゲット相対距離・方位の確認
 ros2 topic echo /target_relative --once
 
-# 3. 機構総合ステータスの確認
 # 4. 機構総合ステータス（ベルト・シリンダ・敵機）の確認
 ros2 topic echo /robot_status --once
 
-# 4. TF 変換（map -> body）の確認
 # 5. TF 変換（map -> body）の確認
 ros2 run tf2_ros tf2_echo map body
 ```
