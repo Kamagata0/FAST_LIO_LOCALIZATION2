@@ -6,8 +6,8 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose, Point, Quaternion
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
+from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
 import rclpy.timer
 import transforms3d.quaternions as tq
@@ -23,9 +23,12 @@ class TransformFusion(Node):
 
         self.cur_odom_to_baselink = None
         self.cur_map_to_odom = None
+        self.path_msg = Path()
+        self.path_msg.header.frame_id = "map"
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.pub_localization = self.create_publisher(Odometry, "/localization", 1)
+        self.pub_localization_path = self.create_publisher(Path, "/localization_path", 10)
         self.pub_robot_marker = self.create_publisher(Marker, "/robot_marker", 1)
 
         self.declare_parameter("odom_topic", "/odom")
@@ -57,6 +60,8 @@ class TransformFusion(Node):
             T_map_to_odom = self.pose_to_mat(self.cur_map_to_odom.pose.pose)
         else:
             T_map_to_odom = np.eye(4)
+            T_map_to_odom[:3, 3] = [-1.95, 3.10, 0.0]
+            T_map_to_odom[:3, :3] = te.euler2mat(0.0, 0.0, -0.0436, axes="sxyz")
 
         transform_msg = Transform()
         transform_msg.translation.x = float(T_map_to_odom[0, 3])
@@ -117,6 +122,19 @@ class TransformFusion(Node):
             localization.child_frame_id = "body"
             self.pub_localization.publish(localization)
             self.publish_robot_marker(localization)
+
+            # Map-frame trajectory path publisher
+            pose_stamped = PoseStamped()
+            pose_stamped.header = localization.header
+            pose_stamped.pose = localization.pose.pose
+            if not hasattr(self, '_path_skip'):
+                self._path_skip = 0
+            self._path_skip += 1
+            if self._path_skip % 3 == 0:
+                self.path_msg.header.stamp = localization.header.stamp
+                self.path_msg.poses.append(pose_stamped)
+                self.pub_localization_path.publish(self.path_msg)
+
             if not hasattr(self, '_pub_count'):
                 self._pub_count = 0
             self._pub_count += 1

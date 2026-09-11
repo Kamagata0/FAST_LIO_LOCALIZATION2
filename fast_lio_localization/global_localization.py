@@ -32,7 +32,7 @@ class FastLIOLocalization(Node):
         self.T_map_to_odom = np.eye(4)
         self.cur_odom = None
         self.cur_scan = None
-        self.scan_buffer = deque(maxlen=10)
+        self.scan_buffer = deque(maxlen=1)
         self.initialized = False
         self.pending_initial_pose = None
         self.last_localization_time = 0.0
@@ -52,13 +52,25 @@ class FastLIOLocalization(Node):
                 ("pcd_map_path", ""),
                 ("lidar_topic", "/livox/lidar"),
                 ("odom_topic", "/odom"),
-                ("initial_pose_x", -1.40),
-                ("initial_pose_y", 1.95),
+                ("initial_pose_x", -1.90),
+                ("initial_pose_y", 3.65),
                 ("initial_pose_z", 0.0),
-                ("initial_pose_yaw", 0.176),
+                ("initial_pose_yaw", -0.0873),
                 ("auto_initial_pose", True),
+                ("enable_auto_snap", False),
             ],
         )
+
+        # Initialize T_map_to_odom with confirmed parameters
+        ix = self.get_parameter("initial_pose_x").value
+        iy = self.get_parameter("initial_pose_y").value
+        iz = self.get_parameter("initial_pose_z").value
+        iyaw = self.get_parameter("initial_pose_yaw").value
+        init_mat = np.eye(4)
+        init_mat[:3, 3] = [ix, iy, iz]
+        init_mat[:3, :3] = te.euler2mat(0.0, 0.0, iyaw, axes="sxyz")
+        self.T_map_to_odom = self.flatten_transform(init_mat)
+        self.initialized = True
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -167,18 +179,18 @@ class FastLIOLocalization(Node):
 
         best_map_to_base = np.copy(T_map_to_base_init)
 
-        # 1. 全周360度（72分割、5度刻み）の角度候補
-        yaw_candidates = np.linspace(-np.pi, np.pi, 72, endpoint=False)
+        # Get initial estimated yaw
+        _, _, init_yaw = te.mat2euler(T_map_to_base_init[:3, :3], axes="sxyz")
 
-        # 2. スタートゾーン周辺（±2.5m範囲、0.12m刻み）のグリッド探索候補
-        # ロボットのスタート位置周辺で全周探索することで、アリーナ反対側の点対称な偽解への誤吸着を完全に防止
+        # 1. ユーザー指定初期姿勢の近傍（±15度、±0.6m）に限定して探索し、点対称な偽解への跳躍を完全排除
+        yaw_candidates = [init_yaw + dyaw for dyaw in np.linspace(-0.26, 0.26, 11)]
+        local_offsets_x = np.linspace(-0.6, 0.6, 9)
+        local_offsets_y = np.linspace(-0.6, 0.6, 9)
+        all_positions = np.array([(cx + float(dx), cy + float(dy)) for dx in local_offsets_x for dy in local_offsets_y])
+        M = len(all_positions)
+
+        inlier_records = [(0, (cx, cy), init_yaw)]
         if hasattr(self, 'kdtree_2d') and self.kdtree_2d is not None and N > 20:
-            local_offsets_x = np.arange(-2.5, 2.6, 0.12)
-            local_offsets_y = np.arange(-2.5, 2.6, 0.12)
-            all_positions = np.array([(cx + float(dx), cy + float(dy)) for dx in local_offsets_x for dy in local_offsets_y])
-            M = len(all_positions)
-
-            inlier_records = []
             for yaw in yaw_candidates:
                 c, s = np.cos(yaw), np.sin(yaw)
                 R = np.array([[c, -s], [s, c]])
@@ -318,9 +330,11 @@ class FastLIOLocalization(Node):
     def initial_snap_and_lock(self, pose_estimation):
         """初期配置の1回だけ実行され、壁に吸着した後はT_map_to_odomを永久固定（走行中は一切更新しない）"""
         self._has_snapped = True
-        if self.global_map is None or self.cur_scan is None or len(self.cur_scan.points) < 50:
+        if not self.get_parameter("enable_auto_snap").value or self.global_map is None or self.cur_scan is None or len(self.cur_scan.points) < 50:
             self.T_map_to_odom = pose_estimation
             self.publish_odom(pose_estimation)
+            self.initialized = True
+            self.get_logger().info(f"【指定位置・角度を100%完全固定】X={pose_estimation[0,3]:.2f}m, Y={pose_estimation[1,3]:.2f}m")
             return
 
         scan_tobe_mapped = copy.copy(self.cur_scan)
@@ -389,7 +403,7 @@ class FastLIOLocalization(Node):
             if self.pending_initial_pose is not None and not hasattr(self, '_has_snapped'):
                 pose_msg, frame_id = self.pending_initial_pose
                 self._handle_initial_pose(pose_msg, frame_id)
-            elif self.get_parameter("auto_initial_pose").value and not self.initialized:
+            elif self.get_parameter("auto_initial_pose").value:
                 ix = self.get_parameter("initial_pose_x").value
                 iy = self.get_parameter("initial_pose_y").value
                 iz = self.get_parameter("initial_pose_z").value
@@ -399,7 +413,10 @@ class FastLIOLocalization(Node):
                 init_mat[:3, :3] = te.euler2mat(0.0, 0.0, iyaw, axes="sxyz")
                 self.T_map_to_odom = self.flatten_transform(init_mat)
                 self.initialized = True
+                self.publish_odom(self.T_map_to_odom)
                 self.get_logger().info(f"Auto-applied default initial pose: x={ix}, y={iy}, yaw={iyaw}")
+            else:
+                self.publish_odom(self.T_map_to_odom)
         
     def cb_save_cur_scan(self, msg):
         if not hasattr(self, '_scan_count'):
@@ -452,9 +469,23 @@ class FastLIOLocalization(Node):
 
         self.cur_scan = o3d.geometry.PointCloud()
         self.cur_scan.points = o3d.utility.Vector3dVector(accumulated_pc)
+
+        # マップ座標系への変換＆フィールド外の体育館ノイズの100%完全除去フィルタ
+        if len(accumulated_pc) > 0:
+            pc_map = (self.T_map_to_odom[:3, :3] @ accumulated_pc.T).T + self.T_map_to_odom[:3, 3]
+            mask_arena = (
+                (pc_map[:, 0] >= -5.95) & (pc_map[:, 0] <= 5.95) &
+                (pc_map[:, 1] >= -4.95) & (pc_map[:, 1] <= 5.95) &
+                (pc_map[:, 2] >= -0.2) & (pc_map[:, 2] <= 2.0)
+            )
+            filtered_pc_map = pc_map[mask_arena]
+        else:
+            filtered_pc_map = np.empty((0, 3), dtype=np.float32)
+
         header = copy.copy(msg.header)
-        header.frame_id = "odom"
-        self.publish_point_cloud(self.pub_pc_in_map, header, accumulated_pc)
+        header.frame_id = "map"
+        self.publish_point_cloud(self.pub_pc_in_map, header, filtered_pc_map)
+        self.publish_odom(self.T_map_to_odom)
 
         # 点群とオドメトリを受信した瞬間に【完全全自動・ノータッチ】でグローバル探索＆3段階ICP吸着を実行して永久固定
         if not hasattr(self, '_has_snapped') and len(accumulated_pc) >= 60 and self.cur_odom is not None:

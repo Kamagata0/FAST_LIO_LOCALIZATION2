@@ -2,7 +2,122 @@
 
 事前に作成した点群地図（PCD）と、LiDAR が取得した現在の点群を照合して、ロボットの自己位置（グローバル位置姿勢）をリアルタイムに推定する ROS 2 パッケージです。
 
-**Isaac Sim（シミュレーション）**、**実機Livox（Mid-360 等）**、**rosbag 再生** の 3 つの実行形態に対応しており、起動引数で柔軟に切り替えられます。
+**Jetson 実機（Livox Mid-360）**、**rosbag 再生**、**Isaac Sim（シミュレーション）** に対応しています。
+
+---
+
+## 🚀 Jetson 実機での「1からの完全セットアップ＆実行ガイド」
+
+Jetson（Orin / Xavier 等）で本システムをゼロから動かすための完全な手順です。上から順にコマンドを実行するだけで動作環境が整います。
+
+### Step 1: Jetson のパフォーマンス最大化（必須）
+処理落ちによる位置のズレ・発散を防ぐため、電源モードを最大クロックに設定します：
+```bash
+sudo nvpmodel -m 0
+sudo jetson_clocks
+```
+
+### Step 2: ROS 2 & システム依存パッケージのインストール
+```bash
+sudo apt update
+sudo apt install -y \
+  ros-humble-pcl-ros \
+  ros-humble-pcl-conversions \
+  ros-humble-tf-transformations \
+  ros-humble-visualization-msgs \
+  ros-humble-perception-pcl \
+  python3-pip \
+  git cmake build-essential
+```
+
+### Step 3: Python 依存ライブラリのインストール
+```bash
+# NumPy 2.x との非互換を防ぐため numpy<2.0.0 を指定
+python3 -m pip install --user "numpy<2.0.0" open3d transforms3d ros2-numpy --break-system-packages
+
+# transforms3d の非推奨型エラー（np.float）を自動修復
+python3 -c "
+import transforms3d.quaternions as tq
+path = tq.__file__
+with open(path, 'r') as f:
+    code = f.read()
+if 'np.float' in code:
+    with open(path, 'w') as f:
+        f.write(code.replace('np.float', 'float'))
+    print('Patched transforms3d successfully.')
+"
+```
+
+### Step 4: Livox-SDK2 のインストール
+```bash
+cd ~
+git clone https://github.com/Livox-SDK/Livox-SDK2.git
+cd Livox-SDK2
+mkdir build && cd build
+cmake .. && make -j$(nproc)
+sudo make install
+```
+
+### Step 5: ワークスペースの作成とリポジトリの配置
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+
+# 1. 本リポジトリのクローン（まだの場合）
+git clone https://github.com/Kamagata0/FAST_LIO_LOCALIZATION2.git
+
+# 2. livox_ros_driver2 のクローン
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+```
+
+### Step 6: パッケージのビルド
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+
+# livox_ros_driver2 のビルド (ROS 2 版)
+colcon build --symlink-install --packages-select livox_ros_driver2 --cmake-args -DROS_EDITION=ROS2
+
+# fast_lio_localization のビルド
+colcon build --symlink-install --packages-select fast_lio_localization
+
+# 環境変数を .bashrc に登録（次回から自動読込）
+echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
+source ~/.bashrc
+```
+
+### Step 7: Jetson と Livox Mid-360 の有線LANネットワーク設定
+Livox Mid-360 のデフォルトIPは `192.168.1.1XX`（ブロードキャストコード下2桁）です。Jetson 側の有線LANのIPアドレスを固定します：
+- **IPアドレス**: `192.168.1.50`
+- **サブネットマスク**: `255.255.255.0`
+- **ゲートウェイ**: `192.168.1.1`
+
+接続確認：
+```bash
+ping -c 3 192.168.1.1XX  # Mid-360 のIP宛て
+```
+
+### Step 8: 実機での起動・自己位置推定
+
+#### ターミナル 1: Livox ドライバの起動
+> **重要**: LiDAR の取り付け向きに合わせて `inverted` 引数を指定します。
+- **正立（通常）設置の場合**:
+  ```bash
+  ros2 launch fast_lio_localization livox.launch.py xfer_format:=1 inverted:=false
+  ```
+- **逆さま（天吊り・倒立）設置の場合**:
+  ```bash
+  ros2 launch fast_lio_localization livox.launch.py xfer_format:=1 inverted:=true
+  ```
+
+#### ターミナル 2: 自己位置推定（FAST-LIO Localization）の起動
+```bash
+ros2 launch fast_lio_localization localization.launch.py lidar_mode:=livox
+```
+
+> **⚠️ 注意事項**: 
+> 起動直後の **2〜3秒間は IMU の重力加速度キャリブレーションを行うため、ロボットを完全に静止** させてください。
+> 起動後、設定済みの初期位置または RViz2 の `2D Pose Estimate` により地図と点群がピタッと一致し、`/localization` トピックに高精度な自己位置が出力されます。
 
 ---
 
