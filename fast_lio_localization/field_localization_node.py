@@ -71,6 +71,8 @@ class FieldLocalizationNode(Node):
         # Publishers
         self.pub_robot_pose = self.create_publisher(PoseStamped, "/robot_pose", 10)
         self.pub_target_rel = self.create_publisher(PointStamped, "/target_relative", 10)
+        self.pub_opponent_pose = self.create_publisher(PoseStamped, "/opponent_pose", 10)
+        self.pub_opponent_rel = self.create_publisher(PointStamped, "/opponent_relative", 10)
         self.pub_filtered_scan = self.create_publisher(PointCloud2, "/field_scan_filtered", 10)
         self.pub_cur_scan = self.create_publisher(PointCloud2, "/cur_scan_in_map", 10)
         self.pub_path = self.create_publisher(Path, "/localization_path", 10)
@@ -232,13 +234,13 @@ class FieldLocalizationNode(Node):
         self.last_pose = np.array([rx, ry, ryaw])
         self.has_valid_pose = True
 
-        # 3. Target extraction from non-wall cluster points
-        target_info = self.extract_target(pts_2d[~wall_mask], rx, ry, ryaw)
+        # 3. Target and Opponent extraction from non-wall cluster points
+        target_info, opp_info = self.extract_target_and_opponent(pts_2d[~wall_mask], rx, ry, ryaw)
 
         proc_time_ms = (time.time() - t0) * 1000.0
 
         # 4. Publish ROS 2 messages & TF
-        self.publish_results(rx, ry, ryaw, target_info, pts, header)
+        self.publish_results(rx, ry, ryaw, target_info, opp_info, pts, header)
 
     def solve_arena_pose(self, pts_2d: np.ndarray):
         """
@@ -299,53 +301,78 @@ class FieldLocalizationNode(Node):
 
         return (robot_x, robot_y, robot_yaw), wall_mask
 
-    def extract_target(self, internal_pts: np.ndarray, rx: float, ry: float, ryaw: float):
+    def extract_target_and_opponent(self, internal_pts: np.ndarray, rx: float, ry: float, ryaw: float):
         """
-        Clusters points inside the arena to locate target objects (ball, platform).
+        Clusters points inside the arena via CAD-map subtraction to locate:
+        1. Opponent Robot (large cluster 0.35m~1.10m, >12 points)
+        2. Target Objects (smaller cluster, 0.10m~0.30m)
         """
         if len(internal_pts) < 10:
-            return None
+            return None, None
 
-        # DBSCAN clustering (30cm radius, min 5 points)
-        clustering = DBSCAN(eps=0.35, min_samples=6).fit(internal_pts)
+        # DBSCAN clustering (35cm radius, min 5 points)
+        clustering = DBSCAN(eps=0.35, min_samples=5).fit(internal_pts)
         labels = clustering.labels_
         unique_labels = set(labels) - {-1}
 
         if not unique_labels:
-            return None
+            return None, None
 
-        # Find closest cluster to robot
         best_target = None
-        min_dist = float("inf")
+        best_opponent = None
+        min_target_dist = float("inf")
+        c, s = np.cos(ryaw), np.sin(ryaw)
 
         for lbl in unique_labels:
             cluster = internal_pts[labels == lbl]
             centroid = np.mean(cluster, axis=0)
             dist = np.linalg.norm(centroid)  # relative distance from LiDAR
 
-            # Discard central teaching podium if it's right in the center (X~0, Y~0 in map)
-            # Map-frame centroid
-            c, s = np.cos(ryaw), np.sin(ryaw)
+            # Global Map-frame centroid
             map_cx = rx + c * centroid[0] - s * centroid[1]
             map_cy = ry + s * centroid[0] + c * centroid[1]
 
-            if abs(map_cx) < 0.8 and abs(map_cy - self.arena_cy) < 0.8:
-                continue  # Podium / Center obstacle
+            # Discard central teaching podium if it's right in the center (X~0, Y~0 in map)
+            if abs(map_cx) < 0.85 and abs(map_cy - self.arena_cy) < 0.85:
+                continue
 
-            if dist < min_dist and dist > 0.4:
-                min_dist = dist
-                angle_rad = math.atan2(centroid[1], centroid[0])
-                best_target = {
+            # Compute cluster bounding box span
+            cluster_span = np.max(cluster, axis=0) - np.min(cluster, axis=0)
+            cluster_width = max(cluster_span[0], cluster_span[1])
+            num_pts = len(cluster)
+
+            angle_rad = math.atan2(centroid[1], centroid[0])
+            angle_deg = math.degrees(angle_rad)
+
+            # Opponent Robot classification: width 0.30m ~ 1.20m and > 12 points
+            if cluster_width >= 0.30 and num_pts >= 12 and dist > 0.6:
+                best_opponent = {
+                    "map_x": float(map_cx),
+                    "map_y": float(map_cy),
                     "rel_x": float(centroid[0]),
                     "rel_y": float(centroid[1]),
                     "distance": float(dist),
                     "angle_rad": float(angle_rad),
-                    "angle_deg": float(math.degrees(angle_rad)),
+                    "angle_deg": float(angle_deg),
+                    "num_pts": int(num_pts),
+                }
+            # Target object classification (ball / smaller payload)
+            elif dist < min_target_dist and dist > 0.3:
+                min_target_dist = dist
+                best_target = {
+                    "map_x": float(map_cx),
+                    "map_y": float(map_cy),
+                    "rel_x": float(centroid[0]),
+                    "rel_y": float(centroid[1]),
+                    "distance": float(dist),
+                    "angle_rad": float(angle_rad),
+                    "angle_deg": float(angle_deg),
+                    "num_pts": int(num_pts),
                 }
 
-        return best_target
+        return best_target, best_opponent
 
-    def publish_results(self, rx, ry, ryaw, target_info, raw_pts, header):
+    def publish_results(self, rx, ry, ryaw, target_info, opp_info, raw_pts, header):
         now_stamp = header.stamp if header.stamp.sec > 0 else self.get_clock().now().to_msg()
 
         # 1. Robot Pose
@@ -385,7 +412,26 @@ class FieldLocalizationNode(Node):
             pt_msg.point.z = 0.0
             self.pub_target_rel.publish(pt_msg)
 
-        # 4. Filtered map-frame point cloud (publish to both /field_scan_filtered and /cur_scan_in_map for RViz)
+        # 4. Opponent Robot Pose & Relative
+        if opp_info is not None:
+            opp_pose = PoseStamped()
+            opp_pose.header.stamp = now_stamp
+            opp_pose.header.frame_id = self.map_frame
+            opp_pose.pose.position.x = opp_info["map_x"]
+            opp_pose.pose.position.y = opp_info["map_y"]
+            opp_pose.pose.position.z = 0.0
+            opp_pose.pose.orientation.w = 1.0
+            self.pub_opponent_pose.publish(opp_pose)
+
+            opp_rel = PointStamped()
+            opp_rel.header.stamp = now_stamp
+            opp_rel.header.frame_id = self.base_frame
+            opp_rel.point.x = opp_info["rel_x"]
+            opp_rel.point.y = opp_info["rel_y"]
+            opp_rel.point.z = 0.0
+            self.pub_opponent_rel.publish(opp_rel)
+
+        # 5. Filtered map-frame point cloud (publish to both /field_scan_filtered and /cur_scan_in_map for RViz)
         if len(raw_pts) > 0:
             c, s = np.cos(ryaw), np.sin(ryaw)
             R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)

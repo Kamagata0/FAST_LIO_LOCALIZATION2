@@ -60,6 +60,16 @@ class RobotDashboardNode(Node):
         self.target_angle_deg = 0.0
         self.has_target = False
 
+        # Opponent Robot State
+        self.opp_map_x = 0.0
+        self.opp_map_y = 0.0
+        self.opp_rel_x = 0.0
+        self.opp_rel_y = 0.0
+        self.opp_dist = 0.0
+        self.opp_angle_deg = 0.0
+        self.has_opponent = False
+        self.last_opp_time = 0.0
+
         # Mechanism Telemetry
         self.belt_target_speed = 1.50  # m/s
         self.belt_actual_speed = 1.48  # m/s
@@ -72,6 +82,8 @@ class RobotDashboardNode(Node):
         self.sub_pose = self.create_subscription(PoseStamped, "/robot_pose", self.cb_robot_pose, 10)
         self.sub_loc_odom = self.create_subscription(Odometry, "/localization", self.cb_loc_odom, 10)
         self.sub_target = self.create_subscription(PointStamped, "/target_relative", self.cb_target_rel, 10)
+        self.sub_opp_pose = self.create_subscription(PoseStamped, "/opponent_pose", self.cb_opp_pose, 10)
+        self.sub_opp_rel = self.create_subscription(PointStamped, "/opponent_relative", self.cb_opp_rel, 10)
         if HAVE_STATUS_MSG:
             self.sub_status = self.create_subscription(RobotStatus, "/robot_status", self.cb_robot_status, 10)
 
@@ -79,6 +91,20 @@ class RobotDashboardNode(Node):
         self.timer = self.create_timer(1.0 / 30.0, self.render_dashboard)
 
         self.get_logger().info("🎨 [Robot Dashboard] 2D Real-time HUD Visualizer Started!")
+
+    def cb_opp_pose(self, msg: PoseStamped):
+        self.opp_map_x = msg.pose.position.x
+        self.opp_map_y = msg.pose.position.y
+        self.has_opponent = True
+        self.last_opp_time = time.time()
+
+    def cb_opp_rel(self, msg: PointStamped):
+        self.opp_rel_x = msg.point.x
+        self.opp_rel_y = msg.point.y
+        self.opp_dist = math.sqrt(self.opp_rel_x ** 2 + self.opp_rel_y ** 2)
+        self.opp_angle_deg = math.degrees(math.atan2(self.opp_rel_y, self.opp_rel_x))
+        self.has_opponent = True
+        self.last_opp_time = time.time()
 
     def cb_loc_odom(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
@@ -183,6 +209,8 @@ class RobotDashboardNode(Node):
             # Target glow & marker
             cv2.circle(canvas, (t_px, t_py), 12, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(canvas, (t_px, t_py), 16, (0, 165, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, (t_px, t_py), 10, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (t_px, t_py), 14, (0, 200, 255), 2, cv2.LINE_AA)
             cv2.line(canvas, (r_px, r_py), (t_px, t_py), (0, 255, 255), 1, cv2.LINE_AA)
 
             # Target distance text
@@ -190,6 +218,27 @@ class RobotDashboardNode(Node):
             mid_y = (r_py + t_py) // 2 - 8
             cv2.putText(canvas, f"{self.target_dist:.2f}m ({self.target_angle_deg:+.1f}deg)",
                         (mid_x - 30, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"TGT {self.target_dist:.2f}m",
+                        (mid_x - 25, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 4b. Draw Opponent Robot (Enemy) Icon & Proximity Line
+        if self.has_opponent and (time.time() - self.last_opp_time < 2.0):
+            opp_px, opp_py = self.map_to_pixel(self.opp_map_x, self.opp_map_y)
+            
+            # Enemy square & pulsing warning marker
+            half_s = 14
+            cv2.rectangle(canvas, (opp_px - half_s, opp_py - half_s), (opp_px + half_s, opp_py + half_s), (0, 0, 255), -1)
+            cv2.rectangle(canvas, (opp_px - half_s - 3, opp_py - half_s - 3), (opp_px + half_s + 3, opp_py + half_s + 3), (50, 50, 255), 2)
+            cv2.putText(canvas, "ENEMY", (opp_px - 22, opp_py - half_s - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (50, 50, 255), 1, cv2.LINE_AA)
+
+            # Proximity warning vector
+            line_col = (0, 0, 255) if self.opp_dist < 2.5 else (100, 100, 200)
+            cv2.line(canvas, (r_px, r_py), (opp_px, opp_py), line_col, 2, cv2.LINE_AA)
+            mid_ox = (r_px + opp_px) // 2
+            mid_oy = (r_py + opp_py) // 2 - 8
+            cv2.putText(canvas, f"ENEMY {self.opp_dist:.2f}m",
+                        (mid_ox - 35, mid_oy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1, cv2.LINE_AA)
 
         # 5. Right-Hand HUD Telemetry Cards Panel
         panel_x = int(self.img_w * 0.65) + 10
@@ -202,6 +251,11 @@ class RobotDashboardNode(Node):
         cv2.putText(canvas, "JETSON DATA SERVER", (panel_x + 15, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 180, 200), 1, cv2.LINE_AA)
         cv2.line(canvas, (panel_x + 15, 95), (self.img_w - 35, 95), (60, 75, 95), 1)
+        cv2.putText(canvas, "ROBOCON 2026", (panel_x + 15, 50),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.70, (0, 230, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "JETSON DATA SERVER", (panel_x + 15, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 180, 200), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 85), (self.img_w - 35, 85), (60, 75, 95), 1)
 
         # Section 1: Robot Pose
         cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 125),
@@ -212,6 +266,10 @@ class RobotDashboardNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(canvas, f"Yaw: {math.degrees(self.robot_yaw):+.2f} deg", (panel_x + 25, 200),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"X: {self.robot_x:+.2f}m  Y: {self.robot_y:+.2f}m  Yaw: {math.degrees(self.robot_yaw):+.1f}deg",
+                    (panel_x + 20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Section 2: Linear Belt Actuator Speeds
         cv2.line(canvas, (panel_x + 15, 225), (self.img_w - 35, 225), (60, 75, 95), 1)
@@ -224,28 +282,61 @@ class RobotDashboardNode(Node):
         speed_err = abs(self.belt_target_speed - self.belt_actual_speed)
         cv2.putText(canvas, f"Speed Error : {speed_err:5.2f} m/s", (panel_x + 25, 325),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 190, 200), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 150), (self.img_w - 35, 150), (60, 75, 95), 1)
+        cv2.putText(canvas, "[ BELT LINEAR ACTUATOR ]", (panel_x + 15, 175),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Target: {self.belt_target_speed:4.2f} m/s  Actual: {self.belt_actual_speed:4.2f} m/s",
+                    (panel_x + 20, 198), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
 
         # Section 3: Air Cylinder
         cv2.line(canvas, (panel_x + 15, 350), (self.img_w - 35, 350), (60, 75, 95), 1)
         cv2.putText(canvas, "[ AIR CYLINDER ]", (panel_x + 15, 375),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 218), (self.img_w - 35, 218), (60, 75, 95), 1)
+        cv2.putText(canvas, "[ AIR CYLINDER ]", (panel_x + 15, 242),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
         cyl_str = "DEPLOYED (ACTIVE)" if self.cylinder_deployed else "RETRACTED"
         cyl_col = (0, 255, 128) if self.cylinder_deployed else (140, 140, 140)
         cv2.putText(canvas, f"State: {cyl_str}", (panel_x + 25, 405),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, cyl_col, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"State: {cyl_str}", (panel_x + 20, 265),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, cyl_col, 1, cv2.LINE_AA)
 
         # Section 4: Target Tracking
         cv2.line(canvas, (panel_x + 15, 435), (self.img_w - 35, 435), (60, 75, 95), 1)
         cv2.putText(canvas, "[ TARGET LOCK ]", (panel_x + 15, 460),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 285), (self.img_w - 35, 285), (60, 75, 95), 1)
+        cv2.putText(canvas, "[ TARGET LOCK ]", (panel_x + 15, 310),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
         if self.has_target:
             cv2.putText(canvas, f"Distance : {self.target_dist:5.2f} m", (panel_x + 25, 490),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(canvas, f"Azimuth  : {self.target_angle_deg:+5.1f} deg", (panel_x + 25, 515),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"Dist: {self.target_dist:4.2f} m   Azimuth: {self.target_angle_deg:+5.1f} deg",
+                        (panel_x + 20, 335), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 255), 1, cv2.LINE_AA)
         else:
             cv2.putText(canvas, "Searching target...", (panel_x + 25, 495),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (120, 140, 160), 1, cv2.LINE_AA)
+            cv2.putText(canvas, "Searching target...", (panel_x + 20, 335),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 140, 160), 1, cv2.LINE_AA)
+
+        # Section 5: Opponent Robot (Enemy) Tracking
+        cv2.line(canvas, (panel_x + 15, 355), (self.img_w - 35, 355), (60, 75, 95), 1)
+        cv2.putText(canvas, "[ OPPONENT ROBOT (ENEMY) ]", (panel_x + 15, 380),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 150, 255), 1, cv2.LINE_AA)
+        if self.has_opponent and (time.time() - self.last_opp_time < 2.0):
+            cv2.putText(canvas, f"Pos: X={self.opp_map_x:+.2f}m, Y={self.opp_map_y:+.2f}m",
+                        (panel_x + 20, 405), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 120, 120), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"Distance: {self.opp_dist:4.2f} m   Bearing: {self.opp_angle_deg:+5.1f} deg",
+                        (panel_x + 20, 428), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
+            if self.opp_dist < 2.5:
+                cv2.putText(canvas, "⚠️ PROXIMITY ALERT!", (panel_x + 20, 452),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(canvas, "Scanning opponent arena...", (panel_x + 20, 405),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 140, 160), 1, cv2.LINE_AA)
 
         # Footer
         cv2.putText(canvas, "ROS2 TELEMETRY SERVER | 30 FPS", (panel_x + 15, self.img_h - 35),

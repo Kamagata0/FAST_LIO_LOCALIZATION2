@@ -13,3 +13,9 @@ float64 target_distance
 float64 target_angle_rad
 float64 target_angle_deg
 
+# 相手ロボット（敵機）追跡情報
+bool opponent_detected
+float64 opponent_distance
+float64 opponent_x
+float64 opponent_y
+float64 opponent_angle_deg
