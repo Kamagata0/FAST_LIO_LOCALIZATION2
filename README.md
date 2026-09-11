@@ -2,7 +2,7 @@
 
 事前に作成した点群地図（PCD）と、LiDAR が取得した現在の点群を照合して、ロボットの自己位置（グローバル位置姿勢）をリアルタイムに推定する ROS 2 パッケージです。
 
-**Isaac Sim（シミュレーション）** と **実機Livox（Mid-360 等）** の両方に対応しており、起動時の `lidar_mode` 引数で切り替えます。
+**Isaac Sim（シミュレーション）**、**実機Livox（Mid-360 等）**、**rosbag 再生** の 3 つの実行形態に対応しており、起動引数で柔軟に切り替えられます。
 
 ---
 
@@ -22,22 +22,23 @@
 ```text
 map → odom → body → livox_frame
 ```
-- `map → odom`: `global_localization.py` / `transform_fusion.py` が発行（地図照合による補正）
-- `odom → body`: FAST-LIO (`fastlio_mapping`) が発行（オドメトリ）
+- `map → odom`: `global_localization.py` / `transform_fusion.py` が発行（地図照合による補正。初期位置入力後に配信開始）
+- `odom → body`: FAST-LIO (`fastlio_mapping`) が発行（高周波オドメトリ）
 - `body → livox_frame`: launch 内の `static_transform_publisher` が発行
 
 ---
 
-## Isaac Sim と 実機Livox の違い
+## 実行形態の違い（Isaac Sim / 実機Livox / rosbag）
 
-| 項目 | Isaac Sim | 実機Livox |
-|---|---|---|
-| 起動モード | `lidar_mode:=isaac` | `lidar_mode:=livox` |
-| LiDAR メッセージ型 | `sensor_msgs/msg/PointCloud2` | `livox_ros_driver2/msg/CustomMsg` |
-| LiDAR トピック名 | `/livox/lidar`（変更時は `lidar_topic` で指定） | `/livox/lidar` |
-| IMU メッセージ型 | `sensor_msgs/msg/Imu` | `sensor_msgs/msg/Imu` |
-| IMU トピック名 | `imu_topic` で指定（デフォルト `/livox/imu`） | 通常 `/livox/imu` |
-| ドライバ起動 | 不要（Isaac Sim から直接配信） | 必要（`livox_ros_driver2` を起動） |
+| 項目 | Isaac Sim | 実機 Livox (Mid-360) | rosbag 再生 |
+|---|---|---|---|
+| 起動モード | `lidar_mode:=isaac` | `lidar_mode:=livox` | bag内の型に合わせる (`livox` or `isaac`) |
+| シミュレーション時刻 | `use_sim_time:=false` (または true) | `use_sim_time:=false` | **`use_sim_time:=true`** (必須) |
+| LiDAR メッセージ型 | `sensor_msgs/msg/PointCloud2` | `livox_ros_driver2/msg/CustomMsg` | bag内に記録された型 |
+| LiDAR トピック名 | `/livox/lidar`（引数で変更可） | `/livox/lidar` | bag内のトピック名（引数で指定） |
+| IMU メッセージ型 | `sensor_msgs/msg/Imu` | `sensor_msgs/msg/Imu` | `sensor_msgs/msg/Imu` |
+| IMU トピック名 | `/livox/imu`（引数で変更可） | `/livox/imu` | bag内のトピック名（引数で指定） |
+| ドライバ起動 | 不要 | **必要** (`livox.launch.py`) | 不要 (`ros2 bag play` で再生) |
 
 ---
 
@@ -152,26 +153,14 @@ source install/setup.bash
 
 ## 起動方法
 
-### A. Isaac Sim（シミュレータ）で使用する場合
+### パターン A: Isaac Sim（シミュレータ）で使用する場合
 
 #### 1. Isaac Sim 側の設定
-Action Graph などで以下のトピックをパブリッシュするように設定します：
-- **LiDAR 点群**:
-  - トピック名: `/livox/lidar`
-  - メッセージ型: `sensor_msgs/msg/PointCloud2`
-  - フレームID: `livox_frame`
-- **IMU**:
-  - トピック名: `/livox/imu`
-  - メッセージ型: `sensor_msgs/msg/Imu`
-  - フレームID: `imu_link`
+Action Graph などで以下のトピックを配信するように設定し、シミュレーションを **Play（再生）** します：
+- **LiDAR 点群**: `/livox/lidar` (`sensor_msgs/msg/PointCloud2`, frame_id: `livox_frame`)
+- **IMU**: `/livox/imu` (`sensor_msgs/msg/Imu`, frame_id: `imu_link`)
 
-> **重要**: FAST-LIO は LiDAR 点群と IMU の**両方**を受信しないと処理（点群登録・自己位置推定）を開始しません。
-
-#### 2. Isaac Sim でシミュレーションを Play（再生）
-
-#### 3. ローカライゼーションノードの起動
-別ターミナルを開いて起動します（デフォルトで RViz2 も起動します）：
-
+#### 2. ローカライゼーションノードの起動
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
@@ -179,8 +168,7 @@ source install/setup.bash
 
 ros2 launch fast_lio_localization localization.launch.py lidar_mode:=isaac
 ```
-
-※トピック名を独自に変更している場合は引数で指定できます：
+※トピック名を変更している場合：
 ```bash
 ros2 launch fast_lio_localization localization.launch.py \
   lidar_mode:=isaac \
@@ -190,17 +178,27 @@ ros2 launch fast_lio_localization localization.launch.py \
 
 ---
 
-### B. 実機 Livox（Mid-360）で使用する場合
+### パターン B: 実機 Livox（Mid-360 / Jetson 等）で使用する場合
+
+> **Jetson を使用する場合の事前準備**:
+> 処理落ちによる EKF の発散（位置の吹き飛び）を防ぐため、最大パフォーマンスに設定してください。
+> ```bash
+> sudo nvpmodel -m 0 && sudo jetson_clocks
+> ```
 
 #### 1. Livox ドライバの起動
-```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
+- **通常（正立）設置の場合**（※`inverted:=false` を必ず指定）:
+  ```bash
+  cd ~/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
 
-# CustomMsg 形式 (xfer_format:=1) で起動
-ros2 launch fast_lio_localization livox.launch.py xfer_format:=1
-```
+  ros2 launch fast_lio_localization livox.launch.py xfer_format:=1 inverted:=false
+  ```
+- **逆さま（倒立）設置の場合**:
+  ```bash
+  ros2 launch fast_lio_localization livox.launch.py xfer_format:=1 inverted:=true
+  ```
 
 #### 2. ローカライゼーションノードの起動
 別ターミナルで起動します：
@@ -212,15 +210,60 @@ source install/setup.bash
 ros2 launch fast_lio_localization localization.launch.py lidar_mode:=livox
 ```
 
+> **注意**: 起動直後の 2〜3 秒間は IMU 重力推定キャリブレーションのため、**ロボットを完全に静止** させてください。
+
 ---
 
-### 別の地図（.pcd）を使用する場合
+### パターン C: rosbag 再生で使用する場合
+
+#### 1. rosbag 内のトピックと形式を確認
+```bash
+ros2 bag info /path/to/your_bag_directory
+```
+*(※フォルダ内に `metadata.yaml` があるディレクトリパスを指定してください)*
+
+- 点群型が `livox_ros_driver2/msg/CustomMsg` の場合 → `lidar_mode:=livox`
+- 点群型が `sensor_msgs/msg/PointCloud2` の場合 → `lidar_mode:=isaac`
+
+#### 2. ローカライゼーションノードの起動 (ターミナル 1)
+rosbag 再生時は必ず **`use_sim_time:=true`** を付与します。
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+# 例: CustomMsg 形式の場合
+ros2 launch fast_lio_localization localization.launch.py \
+  use_sim_time:=true \
+  lidar_mode:=livox \
+  map:=/path/to/your_map.pcd
+
+# 例: PointCloud2 形式でトピック名が異なる場合
+ros2 launch fast_lio_localization localization.launch.py \
+  use_sim_time:=true \
+  lidar_mode:=isaac \
+  lidar_topic:=/my_bag/lidar \
+  imu_topic:=/my_bag/imu \
+  map:=/path/to/your_map.pcd
+```
+
+#### 3. rosbag の再生 (ターミナル 2)
+再生時は必ず **`--clock`** オプションを付与して時刻を配信します。
+```bash
+source ~/ros2_ws/install/setup.bash
+
+ros2 bag play /path/to/your_bag_directory --clock
+```
+
+---
+
+## 別の地図（.pcd）を使用する場合
 
 デフォルトでは `maps/robocon2026_field.pcd` が読み込まれます。別の地図ファイルを使用したい場合は `map` 引数で絶対パスを指定します：
 
 ```bash
 ros2 launch fast_lio_localization localization.launch.py \
-  lidar_mode:=isaac \
+  lidar_mode:=livox \
   map:=/path/to/your_map.pcd
 ```
 
@@ -228,27 +271,26 @@ ros2 launch fast_lio_localization localization.launch.py \
 
 ## RViz2 での初期位置合わせ手順
 
-起動直後はロボットの初期位置がずれているため、RViz2 上で大まかな初期位置を与えて地図照合（ICP）を収束させます。
+起動直後は待機状態となり、**初期位置（`/initialpose`）を入力するまで `/map_to_odom` はパブリッシュされません**。
 
-1. RViz2 の画面上部にある **`2D Pose Estimate`** ツールをクリックします。
+1. 自動起動した RViz2 の画面上部にある **`2D Pose Estimate`** ツールをクリックします。
 2. 地図点群上の**ロボットがいるおおよその位置をクリック**し、**ロボットの進行方向（向き）へドラッグ**して離します。
-3. ロボットを静止させたまま数秒待つと、グローバル地図（白/グレー）とリアルタイム点群（`/cloud_registered`）が壁や障害物の位置にピタッと重なります。
+3. 初期位置が入力されると `global_localization` が自動で ICP マッチングを行い、`/map_to_odom` の配信が始まります。
+4. グローバル地図（白/グレー）とリアルタイム点群（`/cloud_registered`）が壁や障害物の位置にピタッと重なります。
 
 ---
 
 ## 動作確認用コマンド
 
-トピックが正常に配信されているか確認するコマンドです：
-
 ```bash
-# 入力トピックの確認
+# 入力トピックの確認（IMU は約 200Hz）
 ros2 topic hz /livox/lidar
 ros2 topic hz /livox/imu
 
 # 出力トピックの確認
-ros2 topic hz /cloud_registered   # FAST-LIO処理後の点群
-ros2 topic hz /map                # 事前地図の点群
-ros2 topic echo /map_to_odom --once  # 地図照合オフセット
+ros2 topic hz /cloud_registered      # FAST-LIO処理後の点群
+ros2 topic hz /map                   # 事前地図の点群
+ros2 topic echo /map_to_odom --once  # 地図照合オフセット (初期位置入力後に出力)
 ros2 topic echo /localization --once # 推定自己位置
 
 # TF ツリーの確認
@@ -261,12 +303,20 @@ ros2 run tf2_ros tf2_echo body livox_frame
 
 ## トラブルシューティング
 
-### 1. 点群が RViz2 に表示されない / 出ない
+### 1. ロボットが遥か彼方に飛んでいく / 発散する
+- **LiDAR の正立/逆さま設定**: 実機起動時、正立設置なのに `inverted:=false` を忘れていませんか？（`livox.launch.py` はデフォルトが `inverted:=true` のため、Y/Z軸と重力加速度が反転して暴走します）
+- **起動時の静止**: 起動直後（最初の数秒間）にロボットが動いていると重力推定に失敗して吹き飛びます。
+- **Jetson の処理落ち**: `sudo nvpmodel -m 0 && sudo jetson_clocks` を実行してください。
+- **rosbag 時刻設定**: `use_sim_time:=true` と `ros2 bag play ... --clock` の両方が設定されているか確認してください。
+
+### 2. `/map_to_odom` を echo しても何も出力されない
+- **初期位置（2D Pose Estimate）は設定しましたか？**: ノード起動直後は初期化待ち（`Waiting for initial pose...`）となり、初期位置が与えられるまで `/map_to_odom` は配信されません。RViz2 上で `2D Pose Estimate` を行ってください。
+
+### 3. 点群が RViz2 に表示されない / 出ない
 - **IMU トピックは届いていますか？**: `ros2 topic hz /livox/imu` を確認してください。FAST-LIO は IMU が無いと点群を一切処理・出力しません。
-- **Isaac Sim の Action Graph でエラーが出ていませんか？**: センサー Prim の参照パスが切れていると、点群ノードが停止します。
 - **RViz2 の Fixed Frame**: 左上 `Global Options` -> `Fixed Frame` が `map`（または `odom`）になっているか確認してください。
 
-### 2. ビルド時に `livox_ros_driver2Config.cmake` が見つからない
+### 4. ビルド時に `livox_ros_driver2Config.cmake` が見つからない
 - `Livox-SDK2` が正しくインストールされているか確認してください。
 - `~/ros2_ws/src` に `livox_ros_driver2` をクローンし、先にビルドしてから `fast_lio_localization` をビルドしてください。
 

@@ -89,7 +89,7 @@ def generate_launch_description():
                      "scan_voxel_size": 0.1,
                      "freq_localization": 0.5,
                      "freq_global_map": 0.25,
-                     "localization_threshold": 0.5,
+                     "localization_threshold": 0.15,
                      "max_height": 2.2,
                      "fov": 6.28319,
                      "fov_far": 300,

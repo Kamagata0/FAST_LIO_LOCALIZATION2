@@ -32,10 +32,7 @@ class TransformFusion(Node):
         odom_topic = self.get_parameter("odom_topic").value
         self.create_subscription(Odometry, odom_topic, self.cb_save_cur_odom, 1)
         self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, 1)
-
-        self.freq_pub_localization = 50
-        self.timer = self.create_timer(1/self.freq_pub_localization, self.transform_fusion)
-        # threading.Thread(target=self.transform_fusion, daemon=True).start()
+        self.last_published_stamp = None
 
     @staticmethod
     def quat_xyzw_to_wxyz(quat_xyzw):
@@ -74,12 +71,23 @@ class TransformFusion(Node):
         transform_msg.rotation.z = float(quat_xyzw[2])
         transform_msg.rotation.w = float(quat_xyzw[3])
         
+        now_stamp = self.cur_odom_to_baselink.header.stamp if self.cur_odom_to_baselink is not None else self.get_clock().now().to_msg()
+        stamp_tuple = (now_stamp.sec, now_stamp.nanosec)
+        if self.last_published_stamp is not None and stamp_tuple <= self.last_published_stamp:
+            return
+        self.last_published_stamp = stamp_tuple
+
         transform_stamped_msg = tf2_ros.TransformStamped()
-        transform_stamped_msg.header.stamp = self.get_clock().now().to_msg()
+        transform_stamped_msg.header.stamp = now_stamp
         transform_stamped_msg.header.frame_id = "map"
-        transform_stamped_msg.child_frame_id = "odom"
+        transform_stamped_msg.child_frame_id = "camera_init"
         transform_stamped_msg.transform = transform_msg
         self.tf_broadcaster.sendTransform(transform_stamped_msg)
+
+        # また odom フレーム名にも念のため同等に TF ブロードキャスト
+        tf_odom = copy.deepcopy(transform_stamped_msg)
+        tf_odom.child_frame_id = "odom"
+        self.tf_broadcaster.sendTransform(tf_odom)
 
         if self.cur_odom_to_baselink is None:
             return
@@ -94,7 +102,8 @@ class TransformFusion(Node):
             quat_wxyz = tq.mat2quat(R_horizontal)
             quat_xyzw = self.quat_wxyz_to_xyzw(quat_wxyz)
 
-            xyz = T_map_to_base_link[:3, 3]
+            xyz = np.copy(T_map_to_base_link[:3, 3])
+            xyz[2] = 0.0  # 平面フィールド上のため上下の沈み込み・浮きを防止
 
             localization = Odometry()
             localization.pose.pose = Pose(

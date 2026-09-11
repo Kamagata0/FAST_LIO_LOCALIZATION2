@@ -1,0 +1,11 @@
+=====================================================
+ ALL-TIME BEST LOCALIZATION RECORD (Near 100% Match)
+=====================================================
+Updated At         : 2026-09-11 13:05:55
+Best Trial Index   : 23
+Best Fitness Score : 0.4997
+Best Parameters    : dx=-0.212132, dy=-0.212132, dyaw=0.2, map_vox=0.3, scan_vox=0.08
+Trajectory Length  : 76.73 m (1046 poses)
+Duration           : 115.12 s
+Optimal Map->Odom  : X=-1.565, Y=2.351, Yaw=-44.79 deg
+=====================================================

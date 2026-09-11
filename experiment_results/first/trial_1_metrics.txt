@@ -1,0 +1,11 @@
+=====================================================
+ FIRST TRIAL METRICS (Trial #1 Baseline)
+=====================================================
+Date & Time        : 2026-09-11 10:30:58
+Trial Number       : 1
+Fitness Score      : 0.4730
+Parameters         : dx=0.0, dy=0.0, dyaw=0.0, map_vox=0.4, scan_vox=0.1
+Trajectory Length  : 61.53 m (634 poses)
+Duration           : 120.18 s
+Map->Odom Snap     : X=0.050, Y=1.869, Yaw=0.78 deg
+=====================================================

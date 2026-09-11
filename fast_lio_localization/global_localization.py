@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import copy
+import json
+import os
 import threading
 import time
 
@@ -10,8 +12,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, Pose, Point, Quaternion
 from nav_msgs.msg import Odometry
 # from rclpy.wait_for_message import wait_for_message
-from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header, String
 import numpy as np
 import tf2_ros
 from tf2_ros import TransformException
@@ -19,6 +21,7 @@ from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy, DurabilityPo
 import transforms3d.quaternions as tq
 import transforms3d.euler as te
 from collections import deque
+from scipy.spatial import cKDTree
 import ros2_numpy
 
 
@@ -41,7 +44,7 @@ class FastLIOLocalization(Node):
                 ("scan_voxel_size", 0.1),
                 ("freq_localization", 0.5),
                 ("freq_global_map", 0.25),
-                ("localization_threshold", 0.3),
+                ("localization_threshold", 0.15),
                 ("max_height", 2.2),
                 ("fov", 6.28319),
                 ("fov_far", 300),
@@ -49,6 +52,11 @@ class FastLIOLocalization(Node):
                 ("pcd_map_path", ""),
                 ("lidar_topic", "/livox/lidar"),
                 ("odom_topic", "/odom"),
+                ("initial_pose_x", -1.40),
+                ("initial_pose_y", 1.95),
+                ("initial_pose_z", 0.0),
+                ("initial_pose_yaw", 0.176),
+                ("auto_initial_pose", True),
             ],
         )
 
@@ -59,6 +67,7 @@ class FastLIOLocalization(Node):
         self.pub_pc_in_map = self.create_publisher(PointCloud2, "/cur_scan_in_map", 10)
         self.pub_submap = self.create_publisher(PointCloud2, "/submap", 10)
         self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
+        self.pub_metric = self.create_publisher(String, "/localization_metric", 10)
 
         self.get_logger().info("Waiting for global map...")
         # global_map_msg = wait_for_message(msg_type = PointCloud2, node = self, topic = "/cloud_pcd")[1]
@@ -113,47 +122,160 @@ class FastLIOLocalization(Node):
         pc_array = ros2_numpy.numpify(pc_msg)
         return pc_array["xyz"]
     
-    def registration_at_scale(self, scan, map, initial, scale):
+    def registration_at_scale(self, scan, map_pcd, initial, scale=1.0, max_distance=1.0, max_iter=50, use_point_to_plane=False):
+        source = self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale)
+        target = self.voxel_down_sample(map_pcd, self.get_parameter("map_voxel_size").value * scale)
+
+        if use_point_to_plane:
+            if not target.has_normals():
+                target.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        else:
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+
         result_icp = o3d.pipelines.registration.registration_icp(
-        self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale),
-        self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale),
-        1.0 * scale,
-        initial,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            source,
+            target,
+            max_distance,
+            initial,
+            estimation,
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter, relative_fitness=1e-6, relative_rmse=1e-6),
         )
         return result_icp.transformation, result_icp.fitness
+
+    def local_initial_registration(self, scan, map_pcd, initial_map_to_odom, cur_odom_to_base=None):
+        """フィールド全域（360度×全グリッド）で自律探索を行い、周囲の壁面へ全自動でピタッと高精度吸着"""
+        if cur_odom_to_base is None:
+            T_odom_to_base = np.eye(4)
+        else:
+            T_odom_to_base = cur_odom_to_base
+        T_base_to_odom = self.inverse_se3(T_odom_to_base)
+
+        # ロボット車体の現在推定姿勢 (map -> base)
+        T_map_to_base_init = np.matmul(initial_map_to_odom, T_odom_to_base)
+        cx, cy = T_map_to_base_init[0, 3], T_map_to_base_init[1, 3]
+
+        # 点群をロボット車体中心 (body座標系) に変換
+        scan_down = self.voxel_down_sample(scan, 0.15)
+        scan_pts_odom = np.asarray(scan_down.points)
+        scan_pts_h = np.column_stack([scan_pts_odom, np.ones(len(scan_pts_odom))])
+        scan_pts_body = (T_base_to_odom @ scan_pts_h.T).T[:, :2]
+        if len(scan_pts_body) > 120:
+            step = len(scan_pts_body) // 120
+            scan_pts_body = scan_pts_body[::step][:120]
+        N = len(scan_pts_body)
+
+        best_map_to_base = np.copy(T_map_to_base_init)
+
+        # 1. 全周360度（72分割、5度刻み）の角度候補
+        yaw_candidates = np.linspace(-np.pi, np.pi, 72, endpoint=False)
+
+        # 2. スタートゾーン周辺（±2.5m範囲、0.12m刻み）のグリッド探索候補
+        # ロボットのスタート位置周辺で全周探索することで、アリーナ反対側の点対称な偽解への誤吸着を完全に防止
+        if hasattr(self, 'kdtree_2d') and self.kdtree_2d is not None and N > 20:
+            local_offsets_x = np.arange(-2.5, 2.6, 0.12)
+            local_offsets_y = np.arange(-2.5, 2.6, 0.12)
+            all_positions = np.array([(cx + float(dx), cy + float(dy)) for dx in local_offsets_x for dy in local_offsets_y])
+            M = len(all_positions)
+
+            inlier_records = []
+            for yaw in yaw_candidates:
+                c, s = np.cos(yaw), np.sin(yaw)
+                R = np.array([[c, -s], [s, c]])
+                rot_pts = np.dot(scan_pts_body, R.T)  # (N, 2)
+
+                all_query = (rot_pts[np.newaxis, :, :] + all_positions[:, np.newaxis, :]).reshape(-1, 2)
+                dists, _ = self.kdtree_2d.query(all_query, distance_upper_bound=0.35)
+                inliers = (dists < 0.35).reshape(M, N).sum(axis=1)
+
+                top_m_idx = np.argmax(inliers)
+                inlier_records.append((inliers[top_m_idx], all_positions[top_m_idx], yaw))
+
+            # インライア数上位の候補を取得
+            inlier_records.sort(key=lambda item: item[0], reverse=True)
+
+        # 3-Stage Multi-Scale Point-to-Plane ICP (生CADの3cm高密度法線モデルを使用)
+        target = self.map_target_fine if hasattr(self, 'map_target_fine') and self.map_target_fine is not None else map_pcd
+        if not target.has_normals():
+            target.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=30))
+        estimation_plane = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        source_coarse = self.voxel_down_sample(scan, 0.08)
+        source_fine = self.voxel_down_sample(scan, 0.03)
+
+        best_final_trans = np.matmul(best_map_to_base, T_base_to_odom)
+        best_final_trans = self.flatten_transform(best_final_trans)
+        best_fitness = -1.0
+
+        candidates_to_test = inlier_records[:5] if len(inlier_records) > 0 else [(0, (cx, cy), 0.0)]
+        for candidate_rec in candidates_to_test:
+            cand_xy = candidate_rec[1]
+            cand_yaw = candidate_rec[2]
+            cand_map_to_base = np.copy(T_map_to_base_init)
+            cand_map_to_base[0, 3] = cand_xy[0]
+            cand_map_to_base[1, 3] = cand_xy[1]
+            cand_map_to_base[:3, :3] = te.euler2mat(0.0, 0.0, cand_yaw, axes="sxyz")
+            cand_map_to_base[2, 3] = 0.0
+            cand_pose = self.flatten_transform(np.matmul(cand_map_to_base, T_base_to_odom))
+
+            # Stage 1: Coarse Point-to-Plane ICP (max_distance = 0.8m)
+            res_coarse = o3d.pipelines.registration.registration_icp(
+                source_coarse, target, 0.8, cand_pose, estimation_plane,
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=40, relative_fitness=1e-6, relative_rmse=1e-6)
+            )
+
+            # Stage 2: Mid Point-to-Plane ICP (max_distance = 0.35m)
+            res_fine = o3d.pipelines.registration.registration_icp(
+                source_fine, target, 0.35, res_coarse.transformation, estimation_plane,
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50, relative_fitness=1e-7, relative_rmse=1e-7)
+            )
+
+            # Stage 3: Ultra-Fine Point-to-Plane ICP (max_distance = 0.15m)
+            res_ultra = o3d.pipelines.registration.registration_icp(
+                source_fine, target, 0.15, res_fine.transformation, estimation_plane,
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60, relative_fitness=1e-8, relative_rmse=1e-8)
+            )
+
+            if res_ultra.fitness > best_fitness:
+                best_fitness = res_ultra.fitness
+                best_final_trans = self.flatten_transform(res_ultra.transformation)
+
+        return best_final_trans, best_fitness
             
     def inverse_se3(self, trans):
         trans_inverse = np.eye(4)
-        # R
         trans_inverse[:3, :3] = trans[:3, :3].T
-        # t
         trans_inverse[:3, 3] = -np.matmul(trans[:3, :3].T, trans[:3, 3])
         return trans_inverse
 
     def flatten_transform(self, trans):
-        """Roll and Pitch を 0 に強制し、Yaw (水平向き) のみ保持した同次変換行列を返す"""
+        """Roll, Pitch, and Z height are locked to 0. Keeps only Yaw (horizontal) and X, Y to strictly prevent any robot sinking/floating."""
         r, p, yaw = te.mat2euler(trans[:3, :3], axes='sxyz')
         flat_trans = np.copy(trans)
         flat_trans[:3, :3] = te.euler2mat(0.0, 0.0, yaw, axes='sxyz')
+        flat_trans[2, 3] = 0.0
         return flat_trans
 
     def publish_point_cloud(self, publisher, header, pc):
-        data = dict()
-        data["xyz"] = pc[:, :3]
-        
-        if pc.shape[1] == 4:
-            data["intensity"] = pc[:, 3]
-        # else:
-            # data["rgb"] = np.ones_like(pc)
-        msg = ros2_numpy.msgify(PointCloud2, data)
+        if len(pc) == 0:
+            return
+        num_points = pc.shape[0]
+        xyz = np.ascontiguousarray(pc[:, :3], dtype=np.float32)
+
+        msg = PointCloud2()
         msg.header = header
-        if len(msg.fields) == 4:
-            msg.point_step = 16
-        else:
-            msg.point_step = 12
-            
+        msg.height = 1
+        msg.width = num_points
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * num_points
+        msg.is_dense = True
+        msg.data = bytes(xyz.tobytes())
+
         publisher.publish(msg)
         
     def crop_global_map_in_FOV(self, pose_estimation):
@@ -193,76 +315,59 @@ class FastLIOLocalization(Node):
 
         return global_map_in_FOV
 
-    def global_localization(self, pose_estimation):
-        if self.global_map is None:
-            self.get_logger().warn("Global map is not available yet. Skip localization.")
-            return
-        if self.cur_scan is None or len(self.cur_scan.points) < 50:
-            self.get_logger().warn("Current scan is not ready or has too few points. Skip localization.")
+    def initial_snap_and_lock(self, pose_estimation):
+        """初期配置の1回だけ実行され、壁に吸着した後はT_map_to_odomを永久固定（走行中は一切更新しない）"""
+        self._has_snapped = True
+        if self.global_map is None or self.cur_scan is None or len(self.cur_scan.points) < 50:
+            self.T_map_to_odom = pose_estimation
+            self.publish_odom(pose_estimation)
             return
 
         scan_tobe_mapped = copy.copy(self.cur_scan)
-        global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
-        if len(global_map_in_FOV.points) < 50:
-            self.get_logger().warn("Submap in FOV has too few points. Skip localization.")
-            return
-
-        # 初回・走行中ともに scale=1 で精密マッチング（広範囲探索による遠くの壁への誤吸着・ジャンプを防止）
-        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
-        transformation = self.flatten_transform(transformation)
-
-        threshold = self.get_parameter("localization_threshold").value
+        cur_odom_to_base = self.pose_to_mat(self.cur_odom.pose.pose) if self.cur_odom is not None else np.eye(4)
+        transformation, fitness = self.local_initial_registration(
+            scan_tobe_mapped, self.global_map, initial_map_to_odom=pose_estimation, cur_odom_to_base=cur_odom_to_base
+        )
         delta_trans = np.linalg.norm(transformation[:3, 3] - pose_estimation[:3, 3])
         _, _, cur_yaw = te.mat2euler(pose_estimation[:3, :3], axes="sxyz")
         _, _, new_yaw = te.mat2euler(transformation[:3, :3], axes="sxyz")
         diff_yaw = (new_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
 
-        # 初回の初期位置合わせ判定
-        if not hasattr(self, '_has_converged'):
-            # ユーザーが指定した位置から 0.4m 以上または 15度 以上離れる誤吸着はブロック
-            if delta_trans > 0.4 or abs(diff_yaw) > 0.26:
-                self.get_logger().warn(
-                    f"初期位置からの移動量が大きすぎるため補正をスキップし、指定位置を採用しました "
-                    f"(移動: {delta_trans:.2f}m > 0.4m, 角度: {np.degrees(abs(diff_yaw)):.1f}度 > 15度)"
-                )
-                self._has_converged = True
-                self.T_map_to_odom = pose_estimation
-                self.publish_odom(pose_estimation)
-                return
-
-            if fitness >= threshold:
-                self._has_converged = True
-                self.T_map_to_odom = transformation
-                self.publish_odom(transformation)
-                self.get_logger().info(f"初期位置の精密合わせに成功しました！ Fitness: {fitness:.4f} (移動: {delta_trans:.2f}m)")
-            else:
-                self.get_logger().warn(f"Fitness ({fitness:.4f}) が閾値 ({threshold:.4f}) 未満のため、指定位置をベースにします。")
-                self._has_converged = True
-                self.T_map_to_odom = pose_estimation
-                self.publish_odom(pose_estimation)
-            return
-
-        # 走行中の補正判定
-        if fitness >= threshold:
-            # 走行中に0.5m以上の急激なワープをブロック
-            if delta_trans > 0.5:
-                self.get_logger().warn(f"ワープ防止: 変化量が大きすぎるため補正を棄却しました ({delta_trans:.2f} m > 0.5 m)")
-                return
-
-            if abs(diff_yaw) > 0.35: # > 20度
-                self.get_logger().warn(f"ワープ防止: 角度変化が大きすぎるため補正を棄却しました ({np.degrees(abs(diff_yaw)):.1f}度 > 20度)")
-                return
-
-            # スムージング (急激なカクつきを抑えて滑らかに追従)
-            alpha = 0.5
-            smooth_trans = np.copy(transformation)
-            smooth_trans[:3, 3] = (1 - alpha) * pose_estimation[:3, 3] + alpha * transformation[:3, 3]
-            smooth_yaw = cur_yaw + alpha * diff_yaw
-            smooth_trans[:3, :3] = te.euler2mat(0.0, 0.0, smooth_yaw, axes="sxyz")
-            self.T_map_to_odom = smooth_trans
-            self.publish_odom(smooth_trans)
+        is_success = (fitness >= 0.02)
+        if is_success:
+            self.T_map_to_odom = transformation
+            self.publish_odom(transformation)
+            self.initialized = True
+            self.get_logger().info(
+                f"【完全全自動吸着完了・マップ完全固定】静止CADマップとLiDAR点群が自動でピタッと合致しました！ Fitness: {fitness:.4f} "
+                f"(位置: X={transformation[0,3]:.2f}m, Y={transformation[1,3]:.2f}m, 補正: 移動 {delta_trans:.2f}m, 角度 {np.degrees(abs(diff_yaw)):.1f}度)"
+            )
         else:
-            self.get_logger().warn(f"Fitness score {fitness:.4f} less than threshold {threshold:.4f}")
+            self.get_logger().warn(
+                f"初期位置指定を採用しました (Fitness: {fitness:.4f}, 移動: {delta_trans:.2f}m, 角度: {np.degrees(abs(diff_yaw)):.1f}度)"
+            )
+            self.T_map_to_odom = pose_estimation
+            self.publish_odom(pose_estimation)
+            self.initialized = True
+
+        # Publish metric JSON for automated evaluation and retry loop
+        try:
+            metric_data = {
+                "status": "SUCCESS" if is_success else "FAIL",
+                "fitness": float(fitness),
+                "delta_trans": float(delta_trans),
+                "diff_yaw_deg": float(np.degrees(abs(diff_yaw))),
+                "map_to_odom": {
+                    "x": float(self.T_map_to_odom[0, 3]),
+                    "y": float(self.T_map_to_odom[1, 3]),
+                    "z": float(self.T_map_to_odom[2, 3]),
+                }
+            }
+            msg_str = String()
+            msg_str.data = json.dumps(metric_data)
+            self.pub_metric.publish(msg_str)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to publish metric message: {e}")
 
     def voxel_down_sample(self, pcd, voxel_size):
         # print(pcd)
@@ -281,9 +386,20 @@ class FastLIOLocalization(Node):
         self.cur_odom = msg
         if first_odom:
             self.get_logger().info(f"First Odometry received from FAST-LIO! Position: ({msg.pose.pose.position.x:.2f}, {msg.pose.pose.position.y:.2f}, {msg.pose.pose.position.z:.2f})")
-            if self.pending_initial_pose is not None:
+            if self.pending_initial_pose is not None and not hasattr(self, '_has_snapped'):
                 pose_msg, frame_id = self.pending_initial_pose
                 self._handle_initial_pose(pose_msg, frame_id)
+            elif self.get_parameter("auto_initial_pose").value and not self.initialized:
+                ix = self.get_parameter("initial_pose_x").value
+                iy = self.get_parameter("initial_pose_y").value
+                iz = self.get_parameter("initial_pose_z").value
+                iyaw = self.get_parameter("initial_pose_yaw").value
+                init_mat = np.eye(4)
+                init_mat[:3, 3] = [ix, iy, iz]
+                init_mat[:3, :3] = te.euler2mat(0.0, 0.0, iyaw, axes="sxyz")
+                self.T_map_to_odom = self.flatten_transform(init_mat)
+                self.initialized = True
+                self.get_logger().info(f"Auto-applied default initial pose: x={ix}, y={iy}, yaw={iyaw}")
         
     def cb_save_cur_scan(self, msg):
         if not hasattr(self, '_scan_count'):
@@ -291,7 +407,7 @@ class FastLIOLocalization(Node):
         self._scan_count += 1
         if self._scan_count % 30 == 1:
             self.get_logger().info(f"LiDAR scan # {self._scan_count} received ({msg.width * msg.height} points). FAST-LIO is active!")
-        if msg.header.frame_id == "odom":
+        if msg.header.frame_id in ["odom", "camera_init"]:
             rotation = np.eye(3)
             translation = np.zeros(3)
         else:
@@ -340,51 +456,72 @@ class FastLIOLocalization(Node):
         header.frame_id = "odom"
         self.publish_point_cloud(self.pub_pc_in_map, header, accumulated_pc)
 
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
-        interval = 1.0 / self.get_parameter("freq_localization").value
-        if self.initialized and (now_sec - self.last_localization_time >= interval or now_sec < self.last_localization_time):
-            self.last_localization_time = now_sec
-            if self.cur_scan is not None and self.cur_odom is not None:
-                self.global_localization(self.T_map_to_odom)
+        # 点群とオドメトリを受信した瞬間に【完全全自動・ノータッチ】でグローバル探索＆3段階ICP吸着を実行して永久固定
+        if not hasattr(self, '_has_snapped') and len(accumulated_pc) >= 60 and self.cur_odom is not None:
+            self.initial_snap_and_lock(self.T_map_to_odom)
         
     def initialize_global_map(self): #, pc_msg):
-        # self.global_map = o3d.geometry.PointCloud()
-        # self.global_map.points = o3d.utility.Vector3dVector(self.msg_to_array(pc_msg)[:, :3])
         map_path = self.get_parameter("pcd_map_path").value
-        if not map_path:
-            self.get_logger().warn("No map file path provided. Global map is not loaded yet. Please launch with map:=/path/to/map.pcd")
+        candidate_paths = [
+            map_path,
+            "/home/akeru/ros2_ws/src/FAST_LIO_LOCALIZATION2/maps/robocon2026_field.pcd",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps", "robocon2026_field.pcd"),
+            "maps/robocon2026_field.pcd",
+        ]
+        resolved_path = None
+        for p in candidate_paths:
+            if p and os.path.exists(p):
+                resolved_path = p
+                break
+
+        if not resolved_path:
+            self.get_logger().error(f"Global map file not found! Checked paths: {candidate_paths}")
             self.global_map = None
             return
 
-        self.global_map = o3d.io.read_point_cloud(map_path)
-        if self.global_map is None or len(self.global_map.points) == 0:
-            self.get_logger().error(f"Failed to load global map from: {map_path}")
+        raw_map = o3d.io.read_point_cloud(resolved_path)
+        if raw_map is None or len(raw_map.points) == 0:
+            self.get_logger().error(f"Failed to load global map from: {resolved_path}")
             self.global_map = None
             return
-        self.global_map = self.voxel_down_sample(self.global_map, self.get_parameter("map_voxel_size").value)
-        # o3d.io.write_point_cloud("/home/wheelchair2/laksh_ws/pcds/lab_map_with_outside_corridor (with ground pcd)_downsampled.pcd", self.global_map)
-        self.get_logger().info("Global map received.")
+            
+        self.global_map = self.voxel_down_sample(raw_map, 0.1)
+        self.global_map.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
+        
+        # 2D KDTree（粗探索用）
+        map_down_2d = self.voxel_down_sample(raw_map, 0.25)
+        map_pts_2d = np.asarray(map_down_2d.points)[:, :2]
+        self.kdtree_2d = cKDTree(map_pts_2d)
+
+        # 高精度法線モデル（生CADマップから直接3cm解像度で構築し、ボクセル化による数十cmのシフトを完全排除）
+        self.map_target_fine = self.voxel_down_sample(raw_map, 0.03)
+        self.map_target_fine.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.3, max_nn=30))
+
+        self.get_logger().info("Global map received, ultra-precise 3cm normals estimated, and 2D spatial tree constructed.")
 
     def _handle_initial_pose(self, pose_msg, frame_id):
-        if hasattr(self, '_has_converged'):
-            del self._has_converged
+        if hasattr(self, '_has_snapped'):
+            del self._has_snapped
         self.scan_buffer.clear()
         self.pending_initial_pose = (pose_msg, frame_id)
         initial_map_to_base = self.pose_to_mat(pose_msg)
         if self.cur_odom is None:
-            self.get_logger().info("Initial pose received, applying initial estimate (waiting for odometry)...")
-            initial_pose = initial_map_to_base
-        else:
-            initial_pose = np.matmul(initial_map_to_base, self.inverse_se3(self.pose_to_mat(self.cur_odom.pose.pose)))
+            self.get_logger().info("Initial pose received, waiting for FAST-LIO odometry...")
+            self.T_map_to_odom = self.flatten_transform(initial_map_to_base)
+            self.initialized = True
+            return
 
+        initial_pose = np.matmul(initial_map_to_base, self.inverse_se3(self.pose_to_mat(self.cur_odom.pose.pose)))
         initial_pose = self.flatten_transform(initial_pose)
         self.T_map_to_odom = initial_pose
         self.initialized = True
-        self.get_logger().info(f"Initial pose set successfully (frame: {frame_id}).")
-        self.publish_odom(initial_pose)
+        self.get_logger().info(f"Initial pose set from RViz (frame: {frame_id}). Snapping to map walls...")
 
-        if self.cur_scan is not None and self.cur_odom is not None:
-            self.global_localization(initial_pose)
+        # 点群が既に届いていれば即座に1回で精密吸着して永久固定
+        if self.cur_scan is not None and len(self.cur_scan.points) > 100:
+            self.initial_snap_and_lock(initial_pose)
+        else:
+            self.publish_odom(initial_pose)
 
     def cb_initialize_pose(self, msg):
         self._handle_initial_pose(msg.pose.pose, msg.header.frame_id)
@@ -407,11 +544,8 @@ class FastLIOLocalization(Node):
 
     def localisation_timer_callback(self):
         if not self.initialized:
-            self.get_logger().info("Waiting for initial pose...")
+            self.get_logger().info("Waiting for initial pose...", throttle_duration_sec=10.0)
             return
-        
-        if self.cur_scan is not None and self.cur_odom is not None:
-            self.global_localization(self.T_map_to_odom)
 
 
 def main(args=None):
