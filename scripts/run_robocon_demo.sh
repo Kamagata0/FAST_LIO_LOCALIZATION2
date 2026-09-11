@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Robocon 2026 - Ultra-Fast Zero-Odometry Localization & 2D Dashboard Demo
+# ==============================================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+source /opt/ros/humble/setup.bash 2>/dev/null || true
+source "${WORKSPACE_DIR}/../../install/setup.bash" 2>/dev/null || true
+
+export DISPLAY="${DISPLAY:-:0}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+ROSBAG_PATH="/mnt/c/Users/akeer.AKERU/Downloads/09-02_not-game-20260902T141825Z-1-001/09-02_not-game"
+
+echo "=================================================================="
+echo " 🚀 ROBOCON 2026 ULTRA-FAST FIELD LOCALIZATION & 2D HUD DEMO"
+echo " Zero-Odometry | Zero-Initial-Pose | 30fps Real-time Telemetry"
+echo "=================================================================="
+
+# Kill any existing processes
+pkill -9 -f "fastlio_mapping" 2>/dev/null || true
+pkill -9 -f "transform_fusion.py" 2>/dev/null || true
+pkill -9 -f "field_localization_node.py" 2>/dev/null || true
+pkill -9 -f "robot_dashboard_node.py" 2>/dev/null || true
+pkill -9 -f "rviz2" 2>/dev/null || true
+pkill -9 -f "ros2 bag play" 2>/dev/null || true
+sleep 1
+
+# Launch specialized nodes & 2D HUD + RViz2
+echo "1. Launching Robocon System (Field Localization + 2D HUD Dashboard + RViz2 3D)..."
+ros2 launch fast_lio_localization robocon_system.launch.py \
+    use_sim_time:=true \
+    dashboard:=true \
+    rviz:=true &
+LAUNCH_PID=$!
+
+sleep 3
+
+# Play bag
+echo "2. Playing Rosbag..."
+ros2 bag play "${ROSBAG_PATH}" --clock
+
+echo "Playback finished."
+

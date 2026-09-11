@@ -38,9 +38,9 @@ LAUNCH_PID=$!
 sleep 4
 
 # Publish confirmed initial pose
-echo "2. Applying Initial Pose (Rotated CW & Shifted Up): x=-1.90, y=3.65, yaw=-5.00° (-0.0873 rad)..."
+echo "2. Applying Initial Pose: x=-4.36, y=1.30, yaw=-3.00° (-0.052 rad)..."
 python3 "${WORKSPACE_DIR}/fast_lio_localization/publish_initial_pose.py" \
-    -1.90 3.65 0.0 -0.0873 0.0 0.0 --repeat 3 2>/dev/null || true
+    -4.36 1.30 0.0 -0.052 0.0 0.0 --repeat 3 2>/dev/null || true
 
 # Play rosbag
 echo "3. Playing Rosbag with clock..."

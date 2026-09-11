@@ -88,10 +88,12 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
   "msg/Pose6D.msg"
+  "msg/RobotStatus.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  DEPENDENCIES std_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -136,6 +138,8 @@ install(PROGRAMS
   fast_lio_localization/publish_initial_pose.py
   fast_lio_localization/transform_fusion.py
   fast_lio_localization/invert_livox_scan.py
+  fast_lio_localization/field_localization_node.py
+  fast_lio_localization/robot_dashboard_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
