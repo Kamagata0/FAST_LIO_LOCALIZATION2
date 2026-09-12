@@ -13,7 +13,18 @@ source "${WORKSPACE_DIR}/../../install/setup.bash" 2>/dev/null || true
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
-ROSBAG_PATH="/mnt/c/Users/akeer.AKERU/Downloads/09-02_not-game-20260902T141825Z-1-001/09-02_not-game"
+ROSBAG_PATH="${1:-${ROSBAG_PATH}}"
+
+if [ -z "${ROSBAG_PATH}" ] || [ ! -e "${ROSBAG_PATH}" ]; then
+    echo "=================================================================="
+    echo " エラー: rosbag のパスが指定されていないか、存在しません！"
+    echo " 指定されたパス: '${ROSBAG_PATH}'"
+    echo "------------------------------------------------------------------"
+    echo " 使用方法: $0 /path/to/rosbag"
+    echo " 例:       $0 ~/rosbag2_2026_09_08-16_17_47"
+    echo "=================================================================="
+    exit 1
+fi
 
 echo "=================================================================="
 echo " 🚀 ROBOCON 2026 ULTRA-FAST FIELD LOCALIZATION & 2D HUD DEMO"

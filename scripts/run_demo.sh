@@ -13,8 +13,21 @@ source "${WORKSPACE_DIR}/../../install/setup.bash" 2>/dev/null || true
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
-ROSBAG_PATH="/mnt/c/Users/akeer.AKERU/Downloads/09-02_not-game-20260902T141825Z-1-001/09-02_not-game"
-MAP_PATH="${WORKSPACE_DIR}/maps/robocon2026_field.pcd"
+ROSBAG_PATH="${1:-${ROSBAG_PATH}}"
+
+if [ -z "${ROSBAG_PATH}" ] || [ ! -e "${ROSBAG_PATH}" ]; then
+    echo "============================================================"
+    echo " エラー: rosbag のパスが指定されていないか、存在しません！"
+    echo " 指定されたパス: '${ROSBAG_PATH}'"
+    echo "------------------------------------------------------------"
+    echo " 使用方法: $0 /path/to/rosbag [lidar_mode (デフォルト: livox)]"
+    echo " 例:       $0 ~/rosbag2_2026_09_08-16_17_47 isaac"
+    echo "============================================================"
+    exit 1
+fi
+
+LIDAR_MODE="${2:-livox}"
+MAP_PATH="${MAP_PATH:-${WORKSPACE_DIR}/maps/robocon2026_field.pcd}"
 
 echo "============================================================"
 echo " Starting FAST-LIO Localization with RViz2 GUI & Rosbag..."
@@ -35,7 +48,7 @@ sleep 1
 echo "1. Launching FAST-LIO Localization (3D RViz2 + 2D Cyber HUD Dashboard)..."
 ros2 launch fast_lio_localization localization.launch.py \
     use_sim_time:=true \
-    lidar_mode:=livox \
+    lidar_mode:="${LIDAR_MODE}" \
     rviz:=true \
     map:="${MAP_PATH}" &
 LAUNCH_PID=$!

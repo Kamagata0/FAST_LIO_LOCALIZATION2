@@ -10,7 +10,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Configuration defaults
-ROSBAG_PATH="${ROSBAG_PATH:-/mnt/c/Users/akeer.AKERU/Downloads/09-02_not-game-20260902T141825Z-1-001/09-02_not-game}"
+ROSBAG_PATH="${1:-${ROSBAG_PATH}}"
+if [ -z "${ROSBAG_PATH}" ] || [ ! -e "${ROSBAG_PATH}" ]; then
+    echo "エラー: rosbag のパスが指定されていないか、存在しません: '${ROSBAG_PATH}'"
+    echo "使用方法: $0 /path/to/rosbag"
+    exit 1
+fi
 MAP_PATH="${MAP_PATH:-${WORKSPACE_DIR}/maps/robocon2026_field.pcd}"
 BASE_X="${INIT_X:--5.0}"
 BASE_Y="${INIT_Y:-4.5}"
