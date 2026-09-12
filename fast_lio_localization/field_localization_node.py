@@ -22,7 +22,6 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 import tf2_ros
 from scipy.spatial import cKDTree
-from sklearn.cluster import DBSCAN
 import transforms3d.euler as te
 import transforms3d.quaternions as tq
 import ros2_numpy
@@ -245,16 +244,62 @@ class FieldLocalizationNode(Node):
         # 4. Publish ROS 2 messages & TF
         self.publish_results(rx, ry, ryaw, target_info, opp_info, pts, header)
 
+    # Known Own-Court Obstacles for Collision Avoidance
+    OWN_COURT_OBSTACLES = np.array([
+        [-3.86, -2.85],  # Bucket B1
+        [-1.48, -1.82],  # Bucket B2
+        [-5.05,  0.00],  # Bucket B3
+        [-0.87,  0.00],  # Bucket B4
+        [-1.48,  1.82],  # Bucket B5
+        [-3.86,  2.84],  # Bucket B6
+        [-5.38,  5.36],  # Bucket B7
+        [-1.08,  5.34],  # Bucket B8
+        [-3.03,  0.00],  # Flag Pole
+    ], dtype=np.float64)
+
+    @staticmethod
+    def cluster_2d_points(pts: np.ndarray, eps: float = 0.35, min_samples: int = 5):
+        """Pure SciPy KDTree DBSCAN-like clustering (zero external sklearn dependency)"""
+        N = len(pts)
+        if N < min_samples:
+            return []
+        tree = cKDTree(pts)
+        visited = np.zeros(N, dtype=bool)
+        clusters = []
+
+        for i in range(N):
+            if visited[i]:
+                continue
+            nbrs = tree.query_ball_point(pts[i], r=eps)
+            if len(nbrs) < min_samples:
+                continue
+            cluster = list(nbrs)
+            visited[nbrs] = True
+            cur = 0
+            while cur < len(cluster):
+                idx = cluster[cur]
+                sub_nbrs = tree.query_ball_point(pts[idx], r=eps)
+                if len(sub_nbrs) >= min_samples:
+                    for sn in sub_nbrs:
+                        if not visited[sn]:
+                            visited[sn] = True
+                            cluster.append(sn)
+                cur += 1
+            if len(cluster) >= min_samples:
+                clusters.append(pts[cluster])
+        return clusters
+
     def solve_arena_pose(self, pts_2d: np.ndarray):
         """
-        Fast 2D line detection to fit 4 rectangular arena walls.
+        Fast 2D multi-hypothesis fitting against Robocon CAD Map.
+        Enforces own-court boundary (X <= 0.0) and obstacle clearance.
         Returns: (robot_x, robot_y, robot_yaw), wall_inlier_mask
         """
         N = len(pts_2d)
-        if N < 30:
+        if N < 25:
             return None, np.zeros(N, dtype=bool)
 
-        # Compute principal orientations via angular histogram (0 to 90 deg)
+        # 1. 2D PCA & Angular projection
         angles = np.linspace(0, np.pi / 2, 45, endpoint=False)
         best_score = -1
         best_angle = 0.0
@@ -263,8 +308,6 @@ class FieldLocalizationNode(Node):
             c, s = np.cos(ang), np.sin(ang)
             u = pts_2d[:, 0] * c + pts_2d[:, 1] * s
             v = -pts_2d[:, 0] * s + pts_2d[:, 1] * c
-            
-            # Sharpness of projection along orthogonal axes
             hist_u, _ = np.histogram(u, bins=60)
             hist_v, _ = np.histogram(v, bins=60)
             score = np.max(hist_u) + np.max(hist_v)
@@ -277,11 +320,10 @@ class FieldLocalizationNode(Node):
         R_align = np.array([[ca, sa], [-sa, ca]])
         aligned_pts = (R_align @ pts_2d.T).T
 
-        # Find bounding walls (min/max peaks along X and Y)
+        # Find bounding walls
         min_u, max_u = np.percentile(aligned_pts[:, 0], 2), np.percentile(aligned_pts[:, 0], 98)
         min_v, max_v = np.percentile(aligned_pts[:, 1], 2), np.percentile(aligned_pts[:, 1], 98)
 
-        # Identify wall inliers (points within 20cm of detected wall lines)
         wall_thresh = 0.20
         wall_mask = (
             (np.abs(aligned_pts[:, 0] - min_u) < wall_thresh) |
@@ -290,35 +332,62 @@ class FieldLocalizationNode(Node):
             (np.abs(aligned_pts[:, 1] - max_v) < wall_thresh)
         )
 
-        # Center in robot's arena-aligned frame
         center_u = (min_u + max_u) / 2.0
         center_v = (min_v + max_v) / 2.0
 
-        # Global robot pose
-        robot_x = -center_u
-        robot_y = -center_v + self.arena_cy
-        robot_yaw = -best_angle
+        # Evaluate 4 candidate orientations (0, 90, 180, 270 deg)
+        best_inliers = -1
+        best_pose = None
+        obs_tree = cKDTree(self.OWN_COURT_OBSTACLES)
 
-        # Normalize yaw to [-pi, pi]
-        robot_yaw = (robot_yaw + np.pi) % (2 * np.pi) - np.pi
+        for base_yaw in [-best_angle, -best_angle + np.pi/2, -best_angle + np.pi, -best_angle - np.pi/2]:
+            byaw = (base_yaw + np.pi) % (2 * np.pi) - np.pi
+            rx = -center_u * np.cos(best_angle) + center_v * np.sin(best_angle)
+            ry = -center_u * np.sin(best_angle) - center_v * np.cos(best_angle) + self.arena_cy
 
-        return (robot_x, robot_y, robot_yaw), wall_mask
+            # Must stay inside own-court (X <= 0.0)
+            if rx > -0.20:
+                continue
+
+            # Must not collide with buckets or flags
+            d_obs, _ = obs_tree.query(np.array([[rx, ry]]))
+            if d_obs[0] < 0.25:
+                continue
+
+            # Inlier check against CAD map if available
+            if hasattr(self, 'map_kdtree') and self.map_kdtree is not None:
+                c, s = np.cos(byaw), np.sin(byaw)
+                R = np.array([[c, -s], [s, c]])
+                trans_pts = pts_2d @ R.T + np.array([rx, ry])
+                dists, _ = self.map_kdtree.query(trans_pts, distance_upper_bound=0.20)
+                inliers = np.sum(dists < 0.20)
+            else:
+                inliers = N
+
+            if inliers > best_inliers:
+                best_inliers = inliers
+                best_pose = (rx, ry, byaw)
+
+        if best_pose is None:
+            # Fallback to bounded coordinate
+            rx = min(-center_u, -0.50)
+            ry = -center_v + self.arena_cy
+            best_pose = (rx, ry, -best_angle)
+
+        return best_pose, wall_mask
 
     def extract_target_and_opponent(self, internal_pts: np.ndarray, rx: float, ry: float, ryaw: float):
         """
         Clusters points inside the arena via CAD-map subtraction to locate:
         1. Opponent Robot (large cluster 0.35m~1.10m, >12 points)
         2. Target Objects (smaller cluster, 0.10m~0.30m)
+        Uses pure SciPy KD-Tree clustering (100% Jetson compatible).
         """
-        if len(internal_pts) < 10:
+        if len(internal_pts) < 8:
             return None, None
 
-        # DBSCAN clustering (35cm radius, min 5 points)
-        clustering = DBSCAN(eps=0.35, min_samples=5).fit(internal_pts)
-        labels = clustering.labels_
-        unique_labels = set(labels) - {-1}
-
-        if not unique_labels:
+        clusters = self.cluster_2d_points(internal_pts, eps=0.35, min_samples=5)
+        if not clusters:
             return None, None
 
         best_target = None
@@ -326,16 +395,15 @@ class FieldLocalizationNode(Node):
         min_target_dist = float("inf")
         c, s = np.cos(ryaw), np.sin(ryaw)
 
-        for lbl in unique_labels:
-            cluster = internal_pts[labels == lbl]
+        for cluster in clusters:
             centroid = np.mean(cluster, axis=0)
-            dist = np.linalg.norm(centroid)  # relative distance from LiDAR
+            dist = np.linalg.norm(centroid)
 
             # Global Map-frame centroid
             map_cx = rx + c * centroid[0] - s * centroid[1]
             map_cy = ry + s * centroid[0] + c * centroid[1]
 
-            # Discard central teaching podium if it's right in the center (X~0, Y~0 in map)
+            # Discard central teaching podium (X~0, Y~0 in map)
             if abs(map_cx) < 0.85 and abs(map_cy - self.arena_cy) < 0.85:
                 continue
 
@@ -347,8 +415,8 @@ class FieldLocalizationNode(Node):
             angle_rad = math.atan2(centroid[1], centroid[0])
             angle_deg = math.degrees(angle_rad)
 
-            # Opponent Robot classification: width 0.30m ~ 1.20m and > 12 points
-            if cluster_width >= 0.30 and num_pts >= 12 and dist > 0.6:
+            # Opponent Robot classification: width 0.30m ~ 1.20m and > 10 points
+            if cluster_width >= 0.30 and num_pts >= 10 and dist > 0.5:
                 best_opponent = {
                     "map_x": float(map_cx),
                     "map_y": float(map_cy),
@@ -360,7 +428,7 @@ class FieldLocalizationNode(Node):
                     "num_pts": int(num_pts),
                 }
             # Target object classification (ball / smaller payload)
-            elif dist < min_target_dist and dist > 0.3:
+            elif dist < min_target_dist and dist > 0.25:
                 min_target_dist = dist
                 best_target = {
                     "map_x": float(map_cx),
@@ -434,7 +502,7 @@ class FieldLocalizationNode(Node):
             opp_rel.point.z = 0.0
             self.pub_opponent_rel.publish(opp_rel)
 
-        # 5. Filtered map-frame point cloud (publish to both /field_scan_filtered and /cur_scan_in_map for RViz)
+        # 5. Filtered map-frame point cloud
         if len(raw_pts) > 0:
             c, s = np.cos(ryaw), np.sin(ryaw)
             R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
@@ -444,23 +512,25 @@ class FieldLocalizationNode(Node):
             cloud_hdr.stamp = now_stamp
             cloud_hdr.frame_id = self.map_frame
             self.publish_point_cloud(self.pub_filtered_scan, cloud_hdr, trans_pts)
-            self.publish_point_cloud(self.pub_cur_scan, cloud_hdr, trans_pts)
+            if self.publish_tf:
+                self.publish_point_cloud(self.pub_cur_scan, cloud_hdr, trans_pts)
 
-        # 5. Odometry and Trajectory Path for RViz visualization
-        odom_msg = Odometry()
-        odom_msg.header.stamp = now_stamp
-        odom_msg.header.frame_id = self.map_frame
-        odom_msg.child_frame_id = self.base_frame
-        odom_msg.pose.pose = pose_msg.pose
-        self.pub_loc_odom.publish(odom_msg)
+        # 6. Odometry and Trajectory Path (Only when standalone publish_tf is True)
+        if self.publish_tf:
+            odom_msg = Odometry()
+            odom_msg.header.stamp = now_stamp
+            odom_msg.header.frame_id = self.map_frame
+            odom_msg.child_frame_id = self.base_frame
+            odom_msg.pose.pose = pose_msg.pose
+            self.pub_loc_odom.publish(odom_msg)
 
-        if not hasattr(self, '_path_skip'):
-            self._path_skip = 0
-        self._path_skip += 1
-        if self._path_skip % 3 == 0:
-            self.path_msg.header.stamp = now_stamp
-            self.path_msg.poses.append(pose_msg)
-            self.pub_path.publish(self.path_msg)
+            if not hasattr(self, '_path_skip'):
+                self._path_skip = 0
+            self._path_skip += 1
+            if self._path_skip % 3 == 0:
+                self.path_msg.header.stamp = now_stamp
+                self.path_msg.poses.append(pose_msg)
+                self.pub_path.publish(self.path_msg)
 
     def publish_point_cloud(self, pub, header, pc):
         num_points = pc.shape[0]

@@ -79,6 +79,24 @@ def generate_launch_description():
         output="screen",
     )
 
+    initial_pose_x = LaunchConfiguration("initial_pose_x")
+    initial_pose_y = LaunchConfiguration("initial_pose_y")
+    initial_pose_yaw = LaunchConfiguration("initial_pose_yaw")
+    enable_auto_snap = LaunchConfiguration("enable_auto_snap")
+
+    declare_initial_pose_x = DeclareLaunchArgument(
+        "initial_pose_x", default_value="-2.46", description="Initial robot pose X (map frame)"
+    )
+    declare_initial_pose_y = DeclareLaunchArgument(
+        "initial_pose_y", default_value="-3.85", description="Initial robot pose Y (map frame)"
+    )
+    declare_initial_pose_yaw = DeclareLaunchArgument(
+        "initial_pose_yaw", default_value="3.106686", description="Initial robot pose Yaw (rad)"
+    )
+    declare_enable_auto_snap = DeclareLaunchArgument(
+        "enable_auto_snap", default_value="true", description="Enable initial ICP auto-snap"
+    )
+
     # Global localization node
     global_localization_node = Node(
         package="fast_lio_localization",
@@ -87,7 +105,7 @@ def generate_launch_description():
         output="screen",
         parameters=[{"map_voxel_size": 0.4,
                      "scan_voxel_size": 0.1,
-                     "freq_localization": 0.5,
+                     "freq_localization": 2.0,
                      "freq_global_map": 0.25,
                      "localization_threshold": 0.15,
                      "max_height": 2.2,
@@ -97,7 +115,17 @@ def generate_launch_description():
                      "pcd_map_topic": pcd_map_topic,
                      "lidar_topic": "/cloud_registered",
                      "odom_topic": odom_topic,
+                     "initial_pose_x": initial_pose_x,
+                     "initial_pose_y": initial_pose_y,
+                     "initial_pose_z": 0.0,
+                     "initial_pose_yaw": initial_pose_yaw,
+                     "enable_auto_snap": enable_auto_snap,
                      "use_sim_time": use_sim_time}],
+    )
+
+    enable_safety_kill = LaunchConfiguration("enable_safety_kill")
+    declare_enable_safety_kill = DeclareLaunchArgument(
+        "enable_safety_kill", default_value="false", description="Kill node instantly on safety violation"
     )
 
     # Transform fusion node
@@ -106,7 +134,11 @@ def generate_launch_description():
         executable="transform_fusion.py",
         name="transform_fusion",
         output="screen",
-        parameters=[{"odom_topic": odom_topic, "use_sim_time": use_sim_time}],
+        parameters=[{
+            "odom_topic": odom_topic,
+            "use_sim_time": use_sim_time,
+            "enable_safety_kill": enable_safety_kill,
+        }],
     )
 
     lidar_tf_node = Node(
@@ -147,6 +179,11 @@ def generate_launch_description():
     ld.add_action(declare_lidar_topic)
     ld.add_action(declare_imu_topic)
     ld.add_action(declare_odom_topic)
+    ld.add_action(declare_initial_pose_x)
+    ld.add_action(declare_initial_pose_y)
+    ld.add_action(declare_initial_pose_yaw)
+    ld.add_action(declare_enable_auto_snap)
+    ld.add_action(declare_enable_safety_kill)
 
     ld.add_action(fast_lio_node)
     ld.add_action(rviz_node)

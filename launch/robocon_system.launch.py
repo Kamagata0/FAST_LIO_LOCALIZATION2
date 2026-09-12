@@ -61,7 +61,31 @@ def generate_launch_description():
         output="screen",
     )
 
-    # 2. Transform Fusion Node (Map -> Body Global Pose & Trajectory)
+    # 2. Global Localization Node (Aligns to CAD Map & Publishes /map_to_odom)
+    global_loc_node = Node(
+        package="fast_lio_localization",
+        executable="global_localization.py",
+        name="global_localization",
+        output="screen",
+        parameters=[{
+            "map_voxel_size": 0.4,
+            "scan_voxel_size": 0.1,
+            "freq_localization": 0.5,
+            "max_height": 2.2,
+            "pcd_map_path": default_map_path,
+            "pcd_map_topic": "/map",
+            "lidar_topic": "/cloud_registered",
+            "odom_topic": "/Odometry",
+            "use_sim_time": use_sim_time,
+            "enable_auto_snap": True,
+            "initial_pose_x": -3.80,
+            "initial_pose_y": -3.00,
+            "initial_pose_z": 0.0,
+            "initial_pose_yaw": 3.14159,
+        }],
+    )
+
+    # 3. Transform Fusion Node (Map -> Body Global Pose & Trajectory)
     transform_fusion_node = Node(
         package="fast_lio_localization",
         executable="transform_fusion.py",
@@ -73,7 +97,7 @@ def generate_launch_description():
         }],
     )
 
-    # 3. Specialized Robocon Field Localization & Target Node
+    # 4. Specialized Robocon Field Localization & Target Node
     field_loc_node = Node(
         package="fast_lio_localization",
         executable="field_localization_node.py",
@@ -90,7 +114,7 @@ def generate_launch_description():
         }]
     )
 
-    # 4. 2D HUD Dashboard & Mechanism Data Server
+    # 5. 2D HUD Dashboard & Mechanism Data Server
     dashboard_node = Node(
         package="fast_lio_localization",
         executable="robot_dashboard_node.py",
@@ -103,7 +127,7 @@ def generate_launch_description():
         }]
     )
 
-    # 5. Static Transforms
+    # 6. Static Transforms
     static_tf_base_to_livox = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -112,7 +136,7 @@ def generate_launch_description():
         parameters=[{"use_sim_time": use_sim_time}],
     )
 
-    # 6. PCD Map Publisher (Publishes robocon2026_field.pcd to /map)
+    # 7. PCD Map Publisher (Publishes robocon2026_field.pcd to /map)
     pcd_map_node = Node(
         package="pcl_ros",
         executable="pcd_to_pointcloud",
@@ -128,7 +152,7 @@ def generate_launch_description():
         remappings=[("cloud_pcd", "/map")],
     )
 
-    # 7. RViz2 Visualizer
+    # 8. RViz2 Visualizer
     rviz_cfg = os.path.join(pkg_dir, "rviz", "fastlio_localization.rviz")
     rviz_node = Node(
         package="rviz2",
@@ -151,6 +175,7 @@ def generate_launch_description():
         static_tf_base_to_livox,
         pcd_map_node,
         fast_lio_node,
+        global_loc_node,
         transform_fusion_node,
         field_loc_node,
         dashboard_node,

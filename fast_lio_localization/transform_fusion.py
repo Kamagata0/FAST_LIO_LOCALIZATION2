@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+import os
+import sys
 import copy
 import threading
 import time
@@ -18,6 +21,19 @@ from std_msgs.msg import Header
 
 
 class TransformFusion(Node):
+    OFFICIAL_OBJECTS = [
+        ("固定バケツ① B1", -0.870, 0.000, 0.10),
+        ("固定バケツ② B2(H600)", -1.480, -1.820, 0.10),
+        ("固定バケツ③ B3(H300)", -1.480, 1.820, 0.10),
+        ("椅子 CHAIR", -5.155, 0.000, 0.10),
+        ("机 DESK1", -3.860, -2.850, 0.10),
+        ("机 DESK2", -3.860, 2.840, 0.10),
+        ("机 DESK3", -5.560, 5.330, 0.10),
+        ("机 DESK4", -1.080, 5.290, 0.10),
+        ("旗 FLAG", -3.025, -0.120, 0.10),
+        ("教壇 PODIUM", 0.000, 0.550, 0.15),
+    ]
+
     def __init__(self):
         super().__init__("transform_fusion")
 
@@ -32,6 +48,11 @@ class TransformFusion(Node):
         self.pub_robot_marker = self.create_publisher(Marker, "/robot_marker", 1)
 
         self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("enable_safety_kill", False)
+        self.declare_parameter("court_boundary_margin_m", 0.0)
+        self.enable_safety_kill = self.get_parameter("enable_safety_kill").value
+        self.court_margin = self.get_parameter("court_boundary_margin_m").value
+
         odom_topic = self.get_parameter("odom_topic").value
         self.create_subscription(Odometry, odom_topic, self.cb_save_cur_odom, 1)
         self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, 1)
@@ -59,9 +80,8 @@ class TransformFusion(Node):
         if self.cur_map_to_odom is not None:
             T_map_to_odom = self.pose_to_mat(self.cur_map_to_odom.pose.pose)
         else:
-            T_map_to_odom = np.eye(4)
-            T_map_to_odom[:3, 3] = [-1.95, 3.10, 0.0]
-            T_map_to_odom[:3, :3] = te.euler2mat(0.0, 0.0, -0.0436, axes="sxyz")
+            # global_localization からの初回到着を待つ（未到着時の不要なワープ表示を防止）
+            return
 
         transform_msg = Transform()
         transform_msg.translation.x = float(T_map_to_odom[0, 3])
@@ -77,10 +97,7 @@ class TransformFusion(Node):
         transform_msg.rotation.w = float(quat_xyzw[3])
         
         now_stamp = self.cur_odom_to_baselink.header.stamp if self.cur_odom_to_baselink is not None else self.get_clock().now().to_msg()
-        stamp_tuple = (now_stamp.sec, now_stamp.nanosec)
-        if self.last_published_stamp is not None and stamp_tuple <= self.last_published_stamp:
-            return
-        self.last_published_stamp = stamp_tuple
+        self.last_published_stamp = (now_stamp.sec, now_stamp.nanosec)
 
         transform_stamped_msg = tf2_ros.TransformStamped()
         transform_stamped_msg.header.stamp = now_stamp
@@ -90,8 +107,11 @@ class TransformFusion(Node):
         self.tf_broadcaster.sendTransform(transform_stamped_msg)
 
         # また odom フレーム名にも念のため同等に TF ブロードキャスト
-        tf_odom = copy.deepcopy(transform_stamped_msg)
+        tf_odom = tf2_ros.TransformStamped()
+        tf_odom.header.stamp = now_stamp
+        tf_odom.header.frame_id = "map"
         tf_odom.child_frame_id = "odom"
+        tf_odom.transform = transform_msg
         self.tf_broadcaster.sendTransform(tf_odom)
 
         if self.cur_odom_to_baselink is None:
@@ -109,6 +129,30 @@ class TransformFusion(Node):
 
             xyz = np.copy(T_map_to_base_link[:3, 3])
             xyz[2] = 0.0  # 平面フィールド上のため上下の沈み込み・浮きを防止
+
+            # 🚨 リアルタイム安全監視
+            rx, ry = float(xyz[0]), float(xyz[1])
+            if self.enable_safety_kill:
+                if rx > self.court_margin:
+                    self.get_logger().fatal(
+                        f"🚨 [SAFETY KILLED] 相手コート侵入検知！ (X={rx:.3f}m > {self.court_margin:.2f}m)"
+                    )
+                    os._exit(99)
+                for obj_name, ox, oy, limit_d in self.OFFICIAL_OBJECTS:
+                    dist_to_obj = ((rx - ox) ** 2 + (ry - oy) ** 2) ** 0.5
+                    if dist_to_obj < limit_d:
+                        self.get_logger().fatal(
+                            f"🚨 [SAFETY KILLED] [{obj_name}] 接触検知！ (距離={dist_to_obj:.3f}m < {limit_d:.3f}m)"
+                        )
+                        os._exit(98)
+            else:
+                # 警告のみ出力（ノード停止せず走行継続）
+                if rx > self.court_margin:
+                    self.get_logger().warn(f"⚠️ [COURT WARN] 相手コート接近中 (X={rx:.2f}m)")
+                for obj_name, ox, oy, limit_d in self.OFFICIAL_OBJECTS:
+                    dist_to_obj = ((rx - ox) ** 2 + (ry - oy) ** 2) ** 0.5
+                    if dist_to_obj < limit_d:
+                        self.get_logger().warn(f"⚠️ [PROXIMITY WARN] [{obj_name}] 接近 (距離={dist_to_obj:.2f}m)")
 
             localization = Odometry()
             localization.pose.pose = Pose(

@@ -75,11 +75,14 @@ class RobotDashboardNode(Node):
         self.belt_actual_speed = 1.48  # m/s
         self.cylinder_deployed = True
 
+        self.path_history = []
+        self.max_path_len = 500
+
         # Publishers & Subscribers
         if self.publish_image:
             self.pub_image = self.create_publisher(Image, "/robot_dashboard/image", 10)
 
-        self.sub_pose = self.create_subscription(PoseStamped, "/robot_pose", self.cb_robot_pose, 10)
+        # Primary robot pose source: /localization (published by transform_fusion)
         self.sub_loc_odom = self.create_subscription(Odometry, "/localization", self.cb_loc_odom, 10)
         self.sub_target = self.create_subscription(PointStamped, "/target_relative", self.cb_target_rel, 10)
         self.sub_opp_pose = self.create_subscription(PoseStamped, "/opponent_pose", self.cb_opp_pose, 10)
@@ -106,17 +109,17 @@ class RobotDashboardNode(Node):
         self.has_opponent = True
         self.last_opp_time = time.time()
 
+    def _record_path_pt(self, px, py):
+        if not self.path_history or math.hypot(px - self.path_history[-1][0], py - self.path_history[-1][1]) > 0.05:
+            self.path_history.append((px, py))
+            if len(self.path_history) > self.max_path_len:
+                self.path_history.pop(0)
+
     def cb_loc_odom(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+        self._record_path_pt(self.robot_x, self.robot_y)
         q = msg.pose.pose.orientation
-        _, _, self.robot_yaw = te.quat2euler([q.w, q.x, q.y, q.z], axes="sxyz")
-        self.has_robot_pose = True
-
-    def cb_robot_pose(self, msg: PoseStamped):
-        self.robot_x = msg.pose.position.x
-        self.robot_y = msg.pose.position.y
-        q = msg.pose.orientation
         _, _, self.robot_yaw = te.quat2euler([q.w, q.x, q.y, q.z], axes="sxyz")
         self.has_robot_pose = True
 
@@ -160,10 +163,18 @@ class RobotDashboardNode(Node):
         br = self.map_to_pixel(5.85, -4.85)
         cv2.rectangle(canvas, tl, br, (180, 190, 200), 2)
 
-        # Field Center Lines
+        # Center Yellow Line Divider (黄色の境界線: X = 0.0)
         c_top = self.map_to_pixel(0.0, 5.95)
         c_bot = self.map_to_pixel(0.0, -4.85)
-        cv2.line(canvas, c_top, c_bot, (60, 70, 85), 1, cv2.LINE_AA)
+        cv2.line(canvas, c_top, c_bot, (0, 230, 255), 3, cv2.LINE_AA)
+        
+        # Court Area Labels
+        own_lbl_p = self.map_to_pixel(-3.0, 5.60)
+        opp_lbl_p = self.map_to_pixel(2.8, 5.60)
+        cv2.putText(canvas, "[ OWN COURT (X <= 0) ]", (own_lbl_p[0] - 60, own_lbl_p[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 180), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ OPPONENT AREA (FORBIDDEN) ]", (opp_lbl_p[0] - 80, opp_lbl_p[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 100, 255), 1, cv2.LINE_AA)
 
         c_left = self.map_to_pixel(-5.85, 0.55)
         c_right = self.map_to_pixel(5.85, 0.55)
@@ -185,36 +196,55 @@ class RobotDashboardNode(Node):
         cv2.putText(canvas, "PODIUM", (pod_tl[0] + 5, (pod_tl[1] + pod_br[1]) // 2 + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 230, 240), 1, cv2.LINE_AA)
 
-        # Flags (旗・ポール - PCD実測座標: X=±3.02, Y=-0.27)
-        flag_positions = [(-3.03, -0.27), (3.02, -0.27)]
+        # Flags (旗・支柱: 高3000mm, 土台 W390xD390xH180, 中心 X=550mm, Y=3025mm)
+        flag_positions = [(-3.025, -0.12), (3.025, -0.12)]
         for fx, fy in flag_positions:
             f_px, f_py = self.map_to_pixel(fx, fy)
-            # Pole base circle
+            cv2.circle(canvas, (f_px, f_py), 14, (0, 140, 200), 1, cv2.LINE_AA)
             cv2.circle(canvas, (f_px, f_py), 5, (255, 220, 0), -1, cv2.LINE_AA)
-            cv2.circle(canvas, (f_px, f_py), 7, (255, 255, 255), 1, cv2.LINE_AA)
-            # Flag triangle icon
             tri_pts = np.array([[f_px, f_py - 2], [f_px + 14, f_py - 7], [f_px, f_py - 12]], np.int32)
             cv2.fillPoly(canvas, [tri_pts], (0, 100, 255), cv2.LINE_AA)
             cv2.putText(canvas, "FLAG", (f_px - 14, f_py + 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 240, 255), 1, cv2.LINE_AA)
 
-        # Buckets / Scoring Spots (バケツ・回収スポット - PCD実測座標)
-        bucket_positions = [
-            (-3.86, -2.86), (-3.86, 2.84),
-            (3.84, -2.86), (3.84, 2.84),
-            (-1.48, -1.83), (-1.48, 1.82),
-            (1.47, -1.83), (1.47, 1.82),
-            (-5.03, -0.02), (5.00, -0.02),
-            (-1.07, 5.38), (1.06, 5.38),
-            (-5.41, 5.39), (5.40, 5.39)
+        # 固定バケツ①②③ (Robocon 2026 Official Spec)
+        bucket_specs = [
+            ("B1", -0.87, 0.00, "B1"), ("B1", 0.87, 0.00, "B1"),
+            ("B2", -1.48, -1.82, "B2(H600)"), ("B2", 1.48, -1.82, "B2(H600)"),
+            ("B3", -1.48, 1.82, "B3(H300)"), ("B3", 1.48, 1.82, "B3(H300)"),
         ]
-        for bx, by in bucket_positions:
+        for _, bx, by, lbl in bucket_specs:
             b_px, b_py = self.map_to_pixel(bx, by)
-            # Bucket ring & filled center
+            cv2.circle(canvas, (b_px, b_py), 15, (0, 90, 140), 1, cv2.LINE_AA)
             cv2.circle(canvas, (b_px, b_py), 7, (40, 70, 95), -1, cv2.LINE_AA)
             cv2.circle(canvas, (b_px, b_py), 8, (0, 190, 255), 2, cv2.LINE_AA)
-            cv2.putText(canvas, "B", (b_px - 3, b_py + 4),
+            cv2.putText(canvas, lbl, (b_px - 10, b_py + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 255), 1, cv2.LINE_AA)
+
+        # 椅子 (Chair - PCD中心: X=-5.155, Y=0.0)
+        chair_positions = [(-5.155, 0.00), (5.155, 0.00)]
+        for cx_m, cy_m in chair_positions:
+            c_px, c_py = self.map_to_pixel(cx_m, cy_m)
+            cv2.rectangle(canvas, (c_px - 8, c_py - 8), (c_px + 8, c_py + 8), (140, 100, 200), 2)
+            cv2.putText(canvas, "CHAIR", (c_px - 14, c_py + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 180, 255), 1, cv2.LINE_AA)
+
+        # 机 (Desks - PCD中心: Desk1: -3.86,-2.85; Desk2: -3.86,2.84; Desk3: -5.56,5.33; Desk4: -1.08,5.29)
+        desk_positions = [
+            (-3.860, -2.850), (-3.860, 2.840), (3.860, -2.850), (3.860, 2.840),
+            (-5.560, 5.330), (5.560, 5.330), (-1.080, 5.290), (1.080, 5.290),
+        ]
+        for dx_m, dy_m in desk_positions:
+            d_px, d_py = self.map_to_pixel(dx_m, dy_m)
+            cv2.rectangle(canvas, (d_px - 10, d_py - 7), (d_px + 10, d_py + 7), (60, 180, 180), 2)
+            cv2.putText(canvas, "DESK", (d_px - 12, d_py + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.26, (100, 230, 230), 1, cv2.LINE_AA)
+
+        # 2b. Draw Trajectory Trail History (自陣内の無衝突走行履歴)
+        if len(self.path_history) >= 2:
+            pixel_pts = [self.map_to_pixel(hx, hy) for hx, hy in self.path_history]
+            for i in range(len(pixel_pts) - 1):
+                cv2.line(canvas, pixel_pts[i], pixel_pts[i+1], (0, 255, 200), 2, cv2.LINE_AA)
 
         # 3. Draw Robot Icon & Heading
         r_px, r_py = self.map_to_pixel(self.robot_x, self.robot_y)
@@ -295,16 +325,23 @@ class RobotDashboardNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 180, 200), 1, cv2.LINE_AA)
         cv2.line(canvas, (panel_x + 15, 92), (self.img_w - 35, 92), (60, 75, 95), 1)
 
-        # Section 1: Robot Pose (Global)
-        cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"X   : {self.robot_x:+.3f} m", (panel_x + 25, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Y   : {self.robot_y:+.3f} m", (panel_x + 25, 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Yaw : {math.degrees(self.robot_yaw):+.2f} deg", (panel_x + 25, 195),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 215), (self.img_w - 35, 215), (60, 75, 95), 1)
+        # Section 1: Robot Pose & Court Safety Status
+        cv2.putText(canvas, "[ ROBOT POSE & COURT SAFETY ]", (panel_x + 15, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"X   : {self.robot_x:+.3f} m", (panel_x + 25, 142),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Y   : {self.robot_y:+.3f} m", (panel_x + 25, 164),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Yaw : {math.degrees(self.robot_yaw):+.2f} deg", (panel_x + 25, 186),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # Court Boundary & Clearance Check
+        in_own_court = (self.robot_x <= 0.0)
+        court_str = "OWN COURT (SAFE)" if in_own_court else "⚠️ ENEMY AREA (ILLEGAL)"
+        court_col = (0, 255, 180) if in_own_court else (0, 0, 255)
+        cv2.putText(canvas, f"Zone: {court_str}", (panel_x + 25, 208),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, court_col, 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 225), (self.img_w - 35, 225), (60, 75, 95), 1)
 
         # Section 2: Linear Belt Actuator Speeds
         cv2.putText(canvas, "[ BELT LINEAR ACTUATOR ]", (panel_x + 15, 240),

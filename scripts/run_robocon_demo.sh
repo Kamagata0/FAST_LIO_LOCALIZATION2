@@ -13,15 +13,20 @@ source "${WORKSPACE_DIR}/../../install/setup.bash" 2>/dev/null || true
 export DISPLAY="${DISPLAY:-:0}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
-ROSBAG_PATH="${1:-${ROSBAG_PATH}}"
+DEFAULT_BAG="/mnt/c/Users/akeer.AKERU/Downloads/09-02_not-game-20260902T141825Z-1-001/09-02_not-game"
+ROSBAG_PATH="${1:-${ROSBAG_PATH:-${DEFAULT_BAG}}}"
+
+if [ ! -e "${ROSBAG_PATH}" ] && [ -d "${WORKSPACE_DIR}/bags/bag_20260911_233910_run" ]; then
+    ROSBAG_PATH="${WORKSPACE_DIR}/bags/bag_20260911_233910_run"
+fi
 
 if [ -z "${ROSBAG_PATH}" ] || [ ! -e "${ROSBAG_PATH}" ]; then
     echo "=================================================================="
-    echo " エラー: rosbag のパスが指定されていないか、存在しません！"
+    echo " エラー: rosbag のパスが指定されていないか、見つかりません！"
     echo " 指定されたパス: '${ROSBAG_PATH}'"
     echo "------------------------------------------------------------------"
-    echo " 使用方法: $0 /path/to/rosbag"
-    echo " 例:       $0 ~/rosbag2_2026_09_08-16_17_47"
+    echo " 使用方法: $0 [/path/to/rosbag]"
+    echo " 例:       $0 /mnt/c/Users/.../09-02_not-game"
     echo "=================================================================="
     exit 1
 fi
@@ -52,19 +57,26 @@ if [ -z "${LIDAR_MODE}" ]; then
     fi
 fi
 
-# Launch specialized nodes & 2D HUD + RViz2
-echo "1. Launching Robocon System (Field Localization + 2D HUD Dashboard + RViz2 3D)..."
+USE_RVIZ="${USE_RVIZ:-false}"
+
+# Launch specialized nodes & 2D HUD (RViz: Disabled for Ultra Low Latency)
+echo "1. Launching Robocon System (Field Localization + 2D HUD Dashboard | RViz: ${USE_RVIZ})..."
 ros2 launch fast_lio_localization robocon_system.launch.py \
     use_sim_time:=true \
     lidar_mode:="${LIDAR_MODE}" \
     dashboard:=true \
-    rviz:=true &
+    rviz:="${USE_RVIZ}" &
 LAUNCH_PID=$!
 
-sleep 3
+sleep 4
+
+# Publish confirmed collision-free initial pose (x=-2.40, y=-3.80, yaw=180.00 deg)
+echo "2. Applying Initial Pose: x=-2.40, y=-3.80, yaw=180.00° (3.14159 rad)..."
+python3 "${WORKSPACE_DIR}/fast_lio_localization/publish_initial_pose.py" \
+    -2.40 -3.80 0.0 3.14159 0.0 0.0 --repeat 3 2>/dev/null || true
 
 # Play bag
-echo "2. Playing Rosbag..."
+echo "3. Playing Rosbag..."
 ros2 bag play "${ROSBAG_PATH}" --clock
 
 echo "Playback finished."
