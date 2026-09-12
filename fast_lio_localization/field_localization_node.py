@@ -88,8 +88,11 @@ class FieldLocalizationNode(Node):
         # Subscribers
         lidar_topic = self.get_parameter("lidar_topic").value
         self.sub_pc = self.create_subscription(PointCloud2, lidar_topic, self.cb_pointcloud2, 10)
-        if HAVE_LIVOX_MSG:
-            self.sub_livox = self.create_subscription(CustomMsg, lidar_topic, self.cb_livox_custom, 10)
+        if HAVE_LIVOX_MSG and lidar_topic != "/cloud_registered":
+            try:
+                self.sub_livox = self.create_subscription(CustomMsg, lidar_topic, self.cb_livox_custom, 10)
+            except Exception as e:
+                self.get_logger().warn(f"Could not subscribe CustomMsg on {lidar_topic}: {e}")
 
         # State tracking
         self.last_pose = np.array([-1.90, 3.65, -0.0873])  # default startup pose

@@ -40,10 +40,23 @@ pkill -9 -f "rviz2" 2>/dev/null || true
 pkill -9 -f "ros2 bag play" 2>/dev/null || true
 sleep 1
 
+# Detect LiDAR mode from rosbag metadata
+LIDAR_MODE="${2}"
+if [ -z "${LIDAR_MODE}" ]; then
+    if [ -f "${ROSBAG_PATH}/metadata.yaml" ] && grep -q "sensor_msgs/msg/PointCloud2" "${ROSBAG_PATH}/metadata.yaml" 2>/dev/null; then
+        LIDAR_MODE="isaac"
+        echo "🔍 rosbag の LiDAR 型を検出: PointCloud2 -> lidar_mode:=isaac を設定"
+    else
+        LIDAR_MODE="livox"
+        echo "🔍 rosbag の LiDAR 型を検出: CustomMsg -> lidar_mode:=livox を設定"
+    fi
+fi
+
 # Launch specialized nodes & 2D HUD + RViz2
 echo "1. Launching Robocon System (Field Localization + 2D HUD Dashboard + RViz2 3D)..."
 ros2 launch fast_lio_localization robocon_system.launch.py \
     use_sim_time:=true \
+    lidar_mode:="${LIDAR_MODE}" \
     dashboard:=true \
     rviz:=true &
 LAUNCH_PID=$!

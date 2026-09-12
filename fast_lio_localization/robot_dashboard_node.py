@@ -169,12 +169,52 @@ class RobotDashboardNode(Node):
         c_right = self.map_to_pixel(5.85, 0.55)
         cv2.line(canvas, c_left, c_right, (60, 70, 85), 1, cv2.LINE_AA)
 
+        # Center Divider / Slope partitions (中央分離帯・スロープ)
+        div_bot_tl = self.map_to_pixel(-0.15, -0.15)
+        div_bot_br = self.map_to_pixel(0.15, -4.60)
+        cv2.rectangle(canvas, div_bot_tl, div_bot_br, (50, 60, 75), -1)
+        div_top_tl = self.map_to_pixel(-0.15, 5.65)
+        div_top_br = self.map_to_pixel(0.15, 1.25)
+        cv2.rectangle(canvas, div_top_tl, div_top_br, (50, 60, 75), -1)
+
         # Center Teaching Podium (教壇)
         pod_tl = self.map_to_pixel(-0.6, 1.15)
         pod_br = self.map_to_pixel(0.6, -0.05)
         cv2.rectangle(canvas, pod_tl, pod_br, (80, 100, 130), -1)
+        cv2.rectangle(canvas, pod_tl, pod_br, (120, 150, 190), 1)
         cv2.putText(canvas, "PODIUM", (pod_tl[0] + 5, (pod_tl[1] + pod_br[1]) // 2 + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 230, 240), 1, cv2.LINE_AA)
+
+        # Flags (旗・ポール - PCD実測座標: X=±3.02, Y=-0.27)
+        flag_positions = [(-3.03, -0.27), (3.02, -0.27)]
+        for fx, fy in flag_positions:
+            f_px, f_py = self.map_to_pixel(fx, fy)
+            # Pole base circle
+            cv2.circle(canvas, (f_px, f_py), 5, (255, 220, 0), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (f_px, f_py), 7, (255, 255, 255), 1, cv2.LINE_AA)
+            # Flag triangle icon
+            tri_pts = np.array([[f_px, f_py - 2], [f_px + 14, f_py - 7], [f_px, f_py - 12]], np.int32)
+            cv2.fillPoly(canvas, [tri_pts], (0, 100, 255), cv2.LINE_AA)
+            cv2.putText(canvas, "FLAG", (f_px - 14, f_py + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 240, 255), 1, cv2.LINE_AA)
+
+        # Buckets / Scoring Spots (バケツ・回収スポット - PCD実測座標)
+        bucket_positions = [
+            (-3.86, -2.86), (-3.86, 2.84),
+            (3.84, -2.86), (3.84, 2.84),
+            (-1.48, -1.83), (-1.48, 1.82),
+            (1.47, -1.83), (1.47, 1.82),
+            (-5.03, -0.02), (5.00, -0.02),
+            (-1.07, 5.38), (1.06, 5.38),
+            (-5.41, 5.39), (5.40, 5.39)
+        ]
+        for bx, by in bucket_positions:
+            b_px, b_py = self.map_to_pixel(bx, by)
+            # Bucket ring & filled center
+            cv2.circle(canvas, (b_px, b_py), 7, (40, 70, 95), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (b_px, b_py), 8, (0, 190, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, "B", (b_px - 3, b_py + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 255), 1, cv2.LINE_AA)
 
         # 3. Draw Robot Icon & Heading
         r_px, r_py = self.map_to_pixel(self.robot_x, self.robot_y)
@@ -211,6 +251,7 @@ class RobotDashboardNode(Node):
             cv2.circle(canvas, (t_px, t_py), 16, (0, 165, 255), 2, cv2.LINE_AA)
             cv2.circle(canvas, (t_px, t_py), 10, (0, 255, 255), -1, cv2.LINE_AA)
             cv2.circle(canvas, (t_px, t_py), 14, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, (t_px, t_py), 16, (0, 200, 255), 2, cv2.LINE_AA)
             cv2.line(canvas, (r_px, r_py), (t_px, t_py), (0, 255, 255), 1, cv2.LINE_AA)
 
             # Target distance text
@@ -220,6 +261,8 @@ class RobotDashboardNode(Node):
                         (mid_x - 30, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(canvas, f"TGT {self.target_dist:.2f}m",
                         (mid_x - 25, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"TGT {self.target_dist:.2f}m ({self.target_angle_deg:+.1f}deg)",
+                        (mid_x - 45, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
 
         # 4b. Draw Opponent Robot (Enemy) Icon & Proximity Line
         if self.has_opponent and (time.time() - self.last_opp_time < 2.0):
@@ -245,100 +288,75 @@ class RobotDashboardNode(Node):
         cv2.rectangle(canvas, (panel_x, 20), (self.img_w - 20, self.img_h - 20), (28, 34, 44), -1)
         cv2.rectangle(canvas, (panel_x, 20), (self.img_w - 20, self.img_h - 20), (70, 85, 110), 2)
 
-        # Title
+        # Title Header
         cv2.putText(canvas, "ROBOCON 2026", (panel_x + 15, 55),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 230, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, "JETSON DATA SERVER", (panel_x + 15, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 180, 200), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 95), (self.img_w - 35, 95), (60, 75, 95), 1)
-        cv2.putText(canvas, "ROBOCON 2026", (panel_x + 15, 50),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.70, (0, 230, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, "JETSON DATA SERVER", (panel_x + 15, 72),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.72, (0, 230, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "JETSON DATA SERVER", (panel_x + 15, 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 180, 200), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 85), (self.img_w - 35, 85), (60, 75, 95), 1)
+        cv2.line(canvas, (panel_x + 15, 92), (self.img_w - 35, 92), (60, 75, 95), 1)
 
-        # Section 1: Robot Pose
-        cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 125),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"X : {self.robot_x:+.3f} m", (panel_x + 25, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Y : {self.robot_y:+.3f} m", (panel_x + 25, 175),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Yaw: {math.degrees(self.robot_yaw):+.2f} deg", (panel_x + 25, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"X: {self.robot_x:+.2f}m  Y: {self.robot_y:+.2f}m  Yaw: {math.degrees(self.robot_yaw):+.1f}deg",
-                    (panel_x + 20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        # Section 1: Robot Pose (Global)
+        cv2.putText(canvas, "[ ROBOT POSE (GLOBAL) ]", (panel_x + 15, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"X   : {self.robot_x:+.3f} m", (panel_x + 25, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Y   : {self.robot_y:+.3f} m", (panel_x + 25, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Yaw : {math.degrees(self.robot_yaw):+.2f} deg", (panel_x + 25, 195),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 215), (self.img_w - 35, 215), (60, 75, 95), 1)
 
         # Section 2: Linear Belt Actuator Speeds
-        cv2.line(canvas, (panel_x + 15, 225), (self.img_w - 35, 225), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ BELT LINEAR ACTUATOR ]", (panel_x + 15, 250),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Target Speed: {self.belt_target_speed:5.2f} m/s", (panel_x + 25, 275),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 200), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Actual Speed: {self.belt_actual_speed:5.2f} m/s", (panel_x + 25, 300),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ BELT LINEAR ACTUATOR ]", (panel_x + 15, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Target: {self.belt_target_speed:5.2f} m/s", (panel_x + 25, 265),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Actual: {self.belt_actual_speed:5.2f} m/s", (panel_x + 25, 290),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
         speed_err = abs(self.belt_target_speed - self.belt_actual_speed)
-        cv2.putText(canvas, f"Speed Error : {speed_err:5.2f} m/s", (panel_x + 25, 325),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 190, 200), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 150), (self.img_w - 35, 150), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ BELT LINEAR ACTUATOR ]", (panel_x + 15, 175),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Target: {self.belt_target_speed:4.2f} m/s  Actual: {self.belt_actual_speed:4.2f} m/s",
-                    (panel_x + 20, 198), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Error : {speed_err:5.2f} m/s", (panel_x + 25, 315),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 190, 200), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 335), (self.img_w - 35, 335), (60, 75, 95), 1)
 
         # Section 3: Air Cylinder
-        cv2.line(canvas, (panel_x + 15, 350), (self.img_w - 35, 350), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ AIR CYLINDER ]", (panel_x + 15, 375),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 218), (self.img_w - 35, 218), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ AIR CYLINDER ]", (panel_x + 15, 242),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ AIR CYLINDER ]", (panel_x + 15, 360),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 220, 240), 1, cv2.LINE_AA)
         cyl_str = "DEPLOYED (ACTIVE)" if self.cylinder_deployed else "RETRACTED"
         cyl_col = (0, 255, 128) if self.cylinder_deployed else (140, 140, 140)
-        cv2.putText(canvas, f"State: {cyl_str}", (panel_x + 25, 405),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, cyl_col, 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"State: {cyl_str}", (panel_x + 20, 265),
+        cv2.putText(canvas, f"State : {cyl_str}", (panel_x + 25, 390),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, cyl_col, 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 415), (self.img_w - 35, 415), (60, 75, 95), 1)
 
         # Section 4: Target Tracking
-        cv2.line(canvas, (panel_x + 15, 435), (self.img_w - 35, 435), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ TARGET LOCK ]", (panel_x + 15, 460),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 220, 240), 1, cv2.LINE_AA)
-        cv2.line(canvas, (panel_x + 15, 285), (self.img_w - 35, 285), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ TARGET LOCK ]", (panel_x + 15, 310),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ TARGET LOCK ]", (panel_x + 15, 440),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 220, 240), 1, cv2.LINE_AA)
         if self.has_target:
-            cv2.putText(canvas, f"Distance : {self.target_dist:5.2f} m", (panel_x + 25, 490),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"Azimuth  : {self.target_angle_deg:+5.1f} deg", (panel_x + 25, 515),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"Dist: {self.target_dist:4.2f} m   Azimuth: {self.target_angle_deg:+5.1f} deg",
-                        (panel_x + 20, 335), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"Dist  : {self.target_dist:5.2f} m", (panel_x + 25, 468),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"Angle : {self.target_angle_deg:+5.1f} deg", (panel_x + 25, 493),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
         else:
-            cv2.putText(canvas, "Searching target...", (panel_x + 25, 495),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (120, 140, 160), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "Searching target...", (panel_x + 20, 335),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 140, 160), 1, cv2.LINE_AA)
+            cv2.putText(canvas, "Searching target...", (panel_x + 25, 475),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (120, 140, 160), 1, cv2.LINE_AA)
+        cv2.line(canvas, (panel_x + 15, 518), (self.img_w - 35, 518), (60, 75, 95), 1)
 
         # Section 5: Opponent Robot (Enemy) Tracking
-        cv2.line(canvas, (panel_x + 15, 355), (self.img_w - 35, 355), (60, 75, 95), 1)
-        cv2.putText(canvas, "[ OPPONENT ROBOT (ENEMY) ]", (panel_x + 15, 380),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 150, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "[ OPPONENT ROBOT (ENEMY) ]", (panel_x + 15, 542),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (100, 150, 255), 1, cv2.LINE_AA)
         if self.has_opponent and (time.time() - self.last_opp_time < 2.0):
-            cv2.putText(canvas, f"Pos: X={self.opp_map_x:+.2f}m, Y={self.opp_map_y:+.2f}m",
-                        (panel_x + 20, 405), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 120, 120), 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"Distance: {self.opp_dist:4.2f} m   Bearing: {self.opp_angle_deg:+5.1f} deg",
-                        (panel_x + 20, 428), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, f"Pos   : X={self.opp_map_x:+.2f}m, Y={self.opp_map_y:+.2f}m",
+                        (panel_x + 25, 570), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 120, 120), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"Dist  : {self.opp_dist:4.2f} m ({self.opp_angle_deg:+5.1f} deg)",
+                        (panel_x + 25, 595), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 255), 1, cv2.LINE_AA)
             if self.opp_dist < 2.5:
-                cv2.putText(canvas, "⚠️ PROXIMITY ALERT!", (panel_x + 20, 452),
+                cv2.putText(canvas, "⚠️ PROXIMITY ALERT!", (panel_x + 25, 622),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
         else:
-            cv2.putText(canvas, "Scanning opponent arena...", (panel_x + 20, 405),
+            cv2.putText(canvas, "Scanning opponent arena...", (panel_x + 25, 575),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 140, 160), 1, cv2.LINE_AA)
 
         # Footer
+        cv2.line(canvas, (panel_x + 15, 650), (self.img_w - 35, 650), (60, 75, 95), 1)
         cv2.putText(canvas, "ROS2 TELEMETRY SERVER | 30 FPS", (panel_x + 15, self.img_h - 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100, 120, 140), 1, cv2.LINE_AA)
 
